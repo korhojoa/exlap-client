@@ -61,7 +61,6 @@ interface host {
     rest-call-async: func(method: string, path: string, body: string) -> string;
     rest-result-topic: func() -> string;
     get-config: func(name: string) -> option<string>;
-    set-config: func(name: string, value: string);
 }
 
 world packet-hook {

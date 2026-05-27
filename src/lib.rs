@@ -1,28 +1,28 @@
 /// ExLAP WASM hook for aa-proxy-rs.
 ///
 /// Implements the full ExLAP protocol state machine (matching ExlapReader.java)
-/// inside the aa-proxy-rs WASM hooks engine. The hook intercepts packets on
-/// channel 0x7E (configurable via custom-configs), runs auth + session setup,
-/// then streams sensor data updates to the web UI via `host::send_ws_event`.
+/// as a standalone plugin for stock aa-proxy-rs (no host modifications required).
 ///
-/// Key fix over the native implementation: the auth challenge now correctly
+/// The hook watches all packets. When it sees the HU's ServiceDiscoveryResponse
+/// (channel 0, msg_id 6) it finds the ExLAP vendor service, sends a
+/// CHANNEL_OPEN_REQUEST on channel 0x7E, then takes over all packets on that
+/// channel to run auth + session setup.
+///
+/// Key fix over the native implementation: the auth challenge correctly
 /// includes `useHash="sha256"` so the HU knows which digest algorithm to use.
 ///
 /// EV-relevant values (tankLevelSecondary, outsideTemperature) are forwarded
 /// to the AA energy model via `POST /battery` (on the REST whitelist).
 ///
-/// Subscribe/Unsubscribe for additional URLs are triggered from the web UI
+/// Subscribe/Unsubscribe for additional URLs can be triggered from the web UI
 /// via WS `script_event` messages routed to `ws_script_handler`.
-///
-/// Working credential index is persisted via `host::set_config` so the hook
-/// starts with the right credential on the next connection.
 
 #[allow(warnings)]
 mod bindings;
 
 use bindings::aa::packet::host;
 use bindings::aa::packet::types::{
-    ConfigView, CustomConfigEntry, CustomConfigSection, Decision, ModifyContext, Packet,
+    ConfigView, CustomConfigEntry, CustomConfigSection, Decision, ModifyContext, Packet, ProxyType,
 };
 use bindings::Guest;
 
@@ -39,13 +39,18 @@ const CREDENTIALS: &[(&str, &str)] = &[
     ("ML_74-125000", "Fo7arEpPhAgMMznzxRlV8B7eeZgNDIYQcy0Gr7Ad1Fg=="),
 ];
 
-// ── Packet flags (mirroring mitm.rs constants) ───────────────────────────────
+// ── Packet flags and message IDs (mirroring mitm.rs constants) ───────────────
 
 const ENCRYPTED: u8 = 1 << 3;
-const FRAME_TYPE_FIRST: u8 = 1 << 1;
-const FRAME_TYPE_LAST: u8 = 1 << 0;
+const FRAME_TYPE_FIRST: u8 = 1 << 0; // bit 0, matches mitm.rs
+const FRAME_TYPE_LAST: u8 = 1 << 1;  // bit 1, matches mitm.rs
 const CONTROL_FLAG: u8 = 1 << 2;
-const CHAN_OPEN_RSP: u16 = 0x000A;
+
+const MSG_SERVICE_DISCOVERY_RESPONSE: u16 = 6;
+const MSG_CHANNEL_OPEN_REQUEST: u16 = 7;
+const MSG_CHANNEL_OPEN_RESPONSE: u16 = 8;
+
+const EXLAP_SERVICE_NAME: &str = "com.vwag.infotainment.gal.exlap";
 
 // ── Protocol phase ────────────────────────────────────────────────────────────
 
@@ -117,7 +122,7 @@ impl ExlapState {
 
     fn make_pkt(&self, xml: &str) -> Packet {
         Packet {
-            proxy_type: bindings::aa::packet::types::ProxyType::MobileDevice,
+            proxy_type: ProxyType::MobileDevice,
             channel: self.exlap_channel,
             packet_flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
             final_length: None,
@@ -193,7 +198,7 @@ impl Guest for ExlapHook {
                 CustomConfigEntry {
                     name: "exlap_cred_idx".to_string(),
                     typ: "u8".to_string(),
-                    description: "ExLAP credential index to try first (0–3; auto-updated on successful auth)".to_string(),
+                    description: "ExLAP credential index to try first (0–3)".to_string(),
                     default_value: "0".to_string(),
                     values: None,
                 },
@@ -221,8 +226,17 @@ impl Guest for ExlapHook {
     }
 
     fn modify_packet(_ctx: ModifyContext, pkt: Packet, _cfg: ConfigView) -> Decision {
-        let channel = with_state(|s| s.exlap_channel);
+        // Intercept the HU's ServiceDiscoveryResponse so we can open the ExLAP
+        // channel ourselves — no host-side ExLAP code required.
+        if pkt.proxy_type == ProxyType::HeadUnit
+            && pkt.channel == 0
+            && pkt.message_id == MSG_SERVICE_DISCOVERY_RESPONSE
+        {
+            handle_sdr(&pkt);
+            return Decision::Forward; // Other hooks/handlers still need the SDR.
+        }
 
+        let channel = with_state(|s| s.exlap_channel);
         if pkt.channel != channel {
             return Decision::Forward;
         }
@@ -343,7 +357,7 @@ fn handle_control(pkt: &Packet) {
     let msg_id = u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]);
 
     with_state(|s| {
-        if msg_id == CHAN_OPEN_RSP && s.phase == Phase::WaitChanOpen {
+        if msg_id == MSG_CHANNEL_OPEN_RESPONSE && s.phase == Phase::WaitChanOpen {
             host::info(&format!(
                 "exlap-hook: channel {:#04x} open confirmed; sending ExlapConnectionRequest (cred={})",
                 s.exlap_channel, s.cred_idx
@@ -353,6 +367,226 @@ fn handle_control(pkt: &Packet) {
             host::send(&s.make_pkt(&xml));
         }
     });
+}
+
+/// Intercept the HU's ServiceDiscoveryResponse, find the ExLAP vendor service,
+/// and send a CHANNEL_OPEN_REQUEST to open channel 0x7E.
+fn handle_sdr(pkt: &Packet) {
+    // Only act once — when still waiting to open the channel.
+    let phase = with_state(|s| s.phase.clone());
+    if phase != Phase::WaitChanOpen {
+        return;
+    }
+
+    // The payload is [msg_id_hi, msg_id_lo, ...protobuf SDR bytes...].
+    if pkt.payload.len() < 2 {
+        return;
+    }
+    let proto = &pkt.payload[2..];
+
+    if let Some(service_id) = find_exlap_service_id(proto) {
+        with_state(|s| {
+            host::info(&format!(
+                "exlap-hook: found ExLAP service_id={} in SDR; opening channel {:#04x}",
+                service_id, s.exlap_channel
+            ));
+            let open_pkt = build_chan_open_request(s.exlap_channel, service_id);
+            host::send(&open_pkt);
+            // Stay in WaitChanOpen; advance to WaitConnReturn in handle_control
+            // when we receive MSG_CHANNEL_OPEN_RESPONSE.
+        });
+    }
+}
+
+/// Build a CHANNEL_OPEN_REQUEST packet for the given channel and service_id.
+fn build_chan_open_request(channel: u8, service_id: i32) -> Packet {
+    // Protobuf ChannelOpenRequest { priority: sint32 = 0, service_id: int32 = X }
+    // Field 1 (priority, sint32 zigzag): tag=0x08 value=0x00
+    // Field 2 (service_id, int32):       tag=0x10 value=varint(service_id)
+    let mut payload = vec![
+        (MSG_CHANNEL_OPEN_REQUEST >> 8) as u8,
+        (MSG_CHANNEL_OPEN_REQUEST & 0xFF) as u8,
+        0x08, 0x00, // priority = 0 (zigzag-encoded)
+        0x10,       // field 2 tag
+    ];
+    encode_varint(service_id as u64, &mut payload);
+
+    Packet {
+        proxy_type: ProxyType::MobileDevice,
+        channel,
+        packet_flags: ENCRYPTED | CONTROL_FLAG | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        message_id: MSG_CHANNEL_OPEN_REQUEST,
+        payload,
+    }
+}
+
+/// Parse a ServiceDiscoveryResponse protobuf and return the service id of the
+/// ExLAP VendorExtensionService, if present.
+fn find_exlap_service_id(data: &[u8]) -> Option<i32> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let (tag, n) = read_varint(data, pos)?;
+        pos += n;
+        let field = (tag >> 3) as u32;
+        let wire = (tag & 0x7) as u8;
+        match (field, wire) {
+            (1, 2) => {
+                // services: repeated Service (length-delimited)
+                let (len, n) = read_varint(data, pos)?;
+                pos += n;
+                let end = pos + len as usize;
+                if end > data.len() {
+                    return None;
+                }
+                if let Some(id) = parse_service_for_exlap(&data[pos..end]) {
+                    return Some(id);
+                }
+                pos = end;
+            }
+            (_, 2) => {
+                let (len, n) = read_varint(data, pos)?;
+                pos += n + len as usize;
+            }
+            (_, 0) => {
+                let (_, n) = read_varint(data, pos)?;
+                pos += n;
+            }
+            (_, 5) => pos += 4,
+            (_, 1) => pos += 8,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Parse a Service protobuf message, returning its `id` if it has a
+/// VendorExtensionService with service_name == EXLAP_SERVICE_NAME.
+fn parse_service_for_exlap(data: &[u8]) -> Option<i32> {
+    let mut pos = 0;
+    let mut id: Option<i32> = None;
+    let mut is_exlap = false;
+
+    while pos < data.len() {
+        let (tag, n) = read_varint(data, pos)?;
+        pos += n;
+        let field = (tag >> 3) as u32;
+        let wire = (tag & 0x7) as u8;
+        match (field, wire) {
+            (1, 0) => {
+                // id: required int32
+                let (v, n) = read_varint(data, pos)?;
+                pos += n;
+                id = Some(v as i32);
+            }
+            (12, 2) => {
+                // vendor_extension_service: optional VendorExtensionService
+                let (len, n) = read_varint(data, pos)?;
+                pos += n;
+                let end = pos + len as usize;
+                if end > data.len() {
+                    return None;
+                }
+                if is_exlap_vendor_service(&data[pos..end]) {
+                    is_exlap = true;
+                }
+                pos = end;
+            }
+            (_, 2) => {
+                let (len, n) = read_varint(data, pos)?;
+                pos += n + len as usize;
+            }
+            (_, 0) => {
+                let (_, n) = read_varint(data, pos)?;
+                pos += n;
+            }
+            (_, 5) => pos += 4,
+            (_, 1) => pos += 8,
+            _ => return None,
+        }
+    }
+
+    if is_exlap { id } else { None }
+}
+
+/// Return true if this VendorExtensionService protobuf has service_name == EXLAP_SERVICE_NAME.
+fn is_exlap_vendor_service(data: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some((tag, n)) = read_varint(data, pos) else {
+            return false;
+        };
+        pos += n;
+        let field = (tag >> 3) as u32;
+        let wire = (tag & 0x7) as u8;
+        match (field, wire) {
+            (1, 2) => {
+                // service_name: required string
+                let Some((len, n)) = read_varint(data, pos) else {
+                    return false;
+                };
+                pos += n;
+                let end = pos + len as usize;
+                if end > data.len() {
+                    return false;
+                }
+                if let Ok(name) = std::str::from_utf8(&data[pos..end]) {
+                    if name == EXLAP_SERVICE_NAME {
+                        return true;
+                    }
+                }
+                pos = end;
+            }
+            (_, 2) => {
+                let Some((len, n)) = read_varint(data, pos) else {
+                    return false;
+                };
+                pos += n + len as usize;
+            }
+            (_, 0) => {
+                let Some((_, n)) = read_varint(data, pos) else {
+                    return false;
+                };
+                pos += n;
+            }
+            (_, 5) => pos += 4,
+            (_, 1) => pos += 8,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Decode a protobuf varint from `data[pos..]`. Returns `(value, bytes_consumed)`.
+fn read_varint(data: &[u8], pos: usize) -> Option<(u64, usize)> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    let mut n = 0usize;
+    loop {
+        let byte = *data.get(pos + n)?;
+        n += 1;
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some((result, n));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+}
+
+/// Append `v` as a protobuf varint to `buf`.
+fn encode_varint(mut v: u64, buf: &mut Vec<u8>) {
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(byte);
+            return;
+        }
+        buf.push(byte | 0x80);
+    }
 }
 
 fn handle_xml(xml: &str) {
@@ -467,9 +701,6 @@ fn advance_statement(xml: &str) {
                             s.cred_idx,
                             s.user()
                         ));
-                        // Persist the working credential index
-                        host::set_config("exlap_cred_idx", &s.cred_idx.to_string());
-
                         let req = s.make_req("<Dir/>");
                         let pkt = s.make_pkt(&req);
                         s.phase = Phase::WaitUrlList;
