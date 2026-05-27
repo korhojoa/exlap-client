@@ -5,8 +5,8 @@
 ///
 /// The hook watches all packets. When it sees the HU's ServiceDiscoveryResponse
 /// (channel 0, msg_id 6) it finds the ExLAP vendor service, sends a
-/// CHANNEL_OPEN_REQUEST on channel 0x7E, then takes over all packets on that
-/// channel to run auth + session setup.
+/// CHANNEL_OPEN_REQUEST on the discovered channel, then takes over all packets
+/// on that channel to run auth + session setup.
 ///
 /// Key fix over the native implementation: the auth challenge correctly
 /// includes `useHash="sha256"` so the HU knows which digest algorithm to use.
@@ -14,8 +14,9 @@
 /// EV-relevant values (tankLevelSecondary, outsideTemperature) are forwarded
 /// to the AA energy model via `POST /battery` (on the REST whitelist).
 ///
-/// Subscribe/Unsubscribe for additional URLs can be triggered from the web UI
-/// via WS `script_event` messages routed to `ws_script_handler`.
+/// The URLs to subscribe to are configurable via `exlap_subscribe_urls`.
+/// Subscribe/Unsubscribe can also be triggered at runtime via WS
+/// `script_event` messages routed to `ws_script_handler`.
 
 #[allow(warnings)]
 mod bindings;
@@ -38,6 +39,8 @@ const CREDENTIALS: &[(&str, &str)] = &[
     ("RSE_3-DE1400", "KozPo8iE0j72pkbWXKcP0QihpxgML3Opp8fNJZ0wN24=="),
     ("ML_74-125000", "Fo7arEpPhAgMMznzxRlV8B7eeZgNDIYQcy0Gr7Ad1Fg=="),
 ];
+
+const DEFAULT_SUBSCRIBE_URLS: &str = "tankLevelSecondary,outsideTemperature";
 
 // ── Packet flags and message IDs (mirroring mitm.rs constants) ───────────────
 
@@ -70,11 +73,11 @@ enum Phase {
 // ── Session state ─────────────────────────────────────────────────────────────
 
 struct ExlapState {
-    /// Which channel to intercept (default 0x7E, configurable).
+    /// Which channel to intercept; overwritten from the SDR service_id on connect.
     exlap_channel: u8,
     /// Current protocol phase.
     phase: Phase,
-    /// Random hex session ID generated in on_create.
+    /// Random hex session ID, regenerated on each connection.
     session_id: String,
     /// Monotonically increasing request ID.
     req_id: u32,
@@ -88,21 +91,23 @@ struct ExlapState {
     outside_temp: Option<f32>,
     /// Whether the HU reported subscriptionLimitReached.
     subscription_limit_reached: bool,
+    /// URLs to auto-subscribe to after URL list is received (configurable).
+    subscribe_urls: Vec<String>,
 }
 
 impl ExlapState {
-    fn new(exlap_channel: u8, start_cred: usize) -> Self {
-        let session_id = make_session_id();
+    fn new(exlap_channel: u8, start_cred: usize, subscribe_urls: Vec<String>) -> Self {
         Self {
             exlap_channel,
             phase: Phase::WaitChanOpen,
-            session_id,
+            session_id: make_session_id(),
             req_id: 42,
             assemble_buf: Vec::new(),
             cred_idx: start_cred.min(CREDENTIALS.len() - 1),
             tank_level: None,
             outside_temp: None,
             subscription_limit_reached: false,
+            subscribe_urls,
         }
     }
 
@@ -147,6 +152,14 @@ fn make_session_id() -> String {
     buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Parse a comma-separated URL list from config.
+fn parse_subscribe_urls(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .collect()
+}
+
 // ── Global state (single-threaded WASM) ──────────────────────────────────────
 
 static STATE: OnceLock<Mutex<ExlapState>> = OnceLock::new();
@@ -169,15 +182,19 @@ impl Guest for ExlapHook {
         let start_cred: usize = host::get_config("exlap_cred_idx")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0usize);
-
-        STATE
-            .set(Mutex::new(ExlapState::new(channel, start_cred)))
-            .ok();
+        let subscribe_urls = parse_subscribe_urls(
+            &host::get_config("exlap_subscribe_urls")
+                .unwrap_or_else(|| DEFAULT_SUBSCRIBE_URLS.to_string()),
+        );
 
         host::info(&format!(
-            "exlap-hook: created, channel={:#04x} start_cred={}",
-            channel, start_cred
+            "exlap-hook: created channel={:#04x} cred={} subscribe_urls={:?}",
+            channel, start_cred, subscribe_urls
         ));
+
+        STATE
+            .set(Mutex::new(ExlapState::new(channel, start_cred, subscribe_urls)))
+            .ok();
     }
 
     fn on_destroy() {
@@ -191,15 +208,28 @@ impl Guest for ExlapHook {
                 CustomConfigEntry {
                     name: "exlap_channel".to_string(),
                     typ: "u8".to_string(),
-                    description: "AA vendor channel id for ExLAP (default 0x7E = 126)".to_string(),
+                    description: "Fallback channel id if not found in SDR (default 126 = 0x7E)"
+                        .to_string(),
                     default_value: "126".to_string(),
                     values: None,
                 },
                 CustomConfigEntry {
                     name: "exlap_cred_idx".to_string(),
                     typ: "u8".to_string(),
-                    description: "ExLAP credential index to try first (0–3)".to_string(),
+                    description: "Credential index to try first (0–3; hook tries all on failure)"
+                        .to_string(),
                     default_value: "0".to_string(),
+                    values: None,
+                },
+                CustomConfigEntry {
+                    name: "exlap_subscribe_urls".to_string(),
+                    typ: "string".to_string(),
+                    description: format!(
+                        "Comma-separated ExLAP URLs to subscribe to. \
+                         tankLevelSecondary and outsideTemperature also feed POST /battery. \
+                         Default: {DEFAULT_SUBSCRIBE_URLS}"
+                    ),
+                    default_value: DEFAULT_SUBSCRIBE_URLS.to_string(),
                     values: None,
                 },
             ],
@@ -211,15 +241,20 @@ impl Guest for ExlapHook {
             "exlap_channel" => {
                 if let Ok(ch) = value.parse::<u8>() {
                     s.exlap_channel = ch;
-                    host::info(&format!("exlap-hook: channel updated to {:#04x}", ch));
+                    host::info(&format!("exlap-hook: exlap_channel → {:#04x}", ch));
                 }
             }
             "exlap_cred_idx" => {
                 if let Ok(idx) = value.parse::<usize>() {
                     let idx = idx.min(CREDENTIALS.len() - 1);
                     s.cred_idx = idx;
-                    host::info(&format!("exlap-hook: cred_idx updated to {}", idx));
+                    host::info(&format!("exlap-hook: exlap_cred_idx → {}", idx));
                 }
+            }
+            "exlap_subscribe_urls" => {
+                let urls = parse_subscribe_urls(&value);
+                host::info(&format!("exlap-hook: exlap_subscribe_urls → {:?}", urls));
+                s.subscribe_urls = urls;
             }
             _ => {}
         });
@@ -264,12 +299,12 @@ impl Guest for ExlapHook {
                 };
                 with_state(|s| {
                     if s.phase != Phase::Active {
-                        return "error: not active".to_string();
+                        return format!("error: not active (phase={:?})", s.phase);
                     }
                     let body = format!(r#"<Subscribe url="{}" timeStamp="true"/>"#, url);
                     let xml = s.make_req(&body);
                     host::send(&s.make_pkt(&xml));
-                    host::info(&format!("exlap-hook: subscribed to {}", url));
+                    host::info(&format!("exlap-hook: ws subscribe → {}", url));
                     "ok".to_string()
                 })
             }
@@ -280,28 +315,24 @@ impl Guest for ExlapHook {
                 };
                 with_state(|s| {
                     if s.phase != Phase::Active {
-                        return "error: not active".to_string();
+                        return format!("error: not active (phase={:?})", s.phase);
                     }
                     let body = format!(r#"<Unsubscribe url="{}"/>"#, url);
                     let xml = s.make_req(&body);
                     host::send(&s.make_pkt(&xml));
-                    host::info(&format!("exlap-hook: unsubscribed from {}", url));
+                    host::info(&format!("exlap-hook: ws unsubscribe → {}", url));
                     "ok".to_string()
                 })
             }
-            "list" => {
-                // Re-emit the state snapshot so the UI can refresh
-                with_state(|s| {
-                    let state_str = phase_str(&s.phase);
-                    let snapshot = serde_json::json!({
-                        "connection_state": state_str,
-                        "subscription_limit_reached": s.subscription_limit_reached,
-                        "urls": [],
-                    });
-                    host::send_ws_event("exlap", &snapshot.to_string());
-                    "ok".to_string()
-                })
-            }
+            "list" => with_state(|s| {
+                let snapshot = serde_json::json!({
+                    "connection_state": phase_str(&s.phase),
+                    "subscription_limit_reached": s.subscription_limit_reached,
+                    "urls": [],
+                });
+                host::send_ws_event("exlap", &snapshot.to_string());
+                "ok".to_string()
+            }),
             _ => format!("error: unknown cmd {:?}", cmd),
         }
     }
@@ -331,7 +362,7 @@ fn process_packet(pkt: Packet) {
     });
 
     if !is_last {
-        return;
+        return; // More fragments coming.
     }
 
     let xml = with_state(|s| {
@@ -343,74 +374,514 @@ fn process_packet(pkt: Packet) {
     });
 
     let Some(xml) = xml else {
-        host::error("exlap-hook: invalid UTF-8 in packet, dropping");
+        host::error("exlap-hook: invalid UTF-8 in packet");
         return;
     };
 
     handle_xml(&xml);
 }
 
+/// Handle a control-flag packet on the ExLAP channel.
 fn handle_control(pkt: &Packet) {
     if pkt.payload.len() < 2 {
         return;
     }
     let msg_id = u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]);
 
+    if msg_id != MSG_CHANNEL_OPEN_RESPONSE {
+        host::info(&format!(
+            "exlap-hook: control msg_id={:#06x} on ExLAP channel (ignored)",
+            msg_id
+        ));
+        return;
+    }
+
+    // Parse ChannelOpenResponse status (field 1, varint). STATUS_OK = 0.
+    let status = if pkt.payload.len() >= 4 && pkt.payload[2] == 0x08 {
+        pkt.payload[3] as i32
+    } else {
+        0 // field absent → default STATUS_OK
+    };
+
     with_state(|s| {
-        if msg_id == MSG_CHANNEL_OPEN_RESPONSE && s.phase == Phase::WaitChanOpen {
+        if s.phase != Phase::WaitChanOpen {
             host::info(&format!(
-                "exlap-hook: channel {:#04x} open confirmed; sending ExlapConnectionRequest (cred={})",
-                s.exlap_channel, s.cred_idx
+                "exlap-hook: unexpected CHANNEL_OPEN_RESPONSE in phase {:?} (status={})",
+                s.phase, status
             ));
-            s.phase = Phase::WaitConnReturn;
-            let xml = format!(r#"<ExlapConnectionRequest session_id="{}"/>"#, s.session_id);
-            host::send(&s.make_pkt(&xml));
+            return;
         }
+
+        if status != 0 {
+            host::error(&format!(
+                "exlap-hook: CHANNEL_OPEN_RESPONSE status={} on ch={:#04x}; \
+                 channel open may have failed",
+                status, s.exlap_channel
+            ));
+            // Proceed anyway — some HUs return non-zero but still open the channel.
+        }
+
+        host::info(&format!(
+            "exlap-hook: channel {:#04x} open (status={}); \
+             sending ExlapConnectionRequest session_id={} cred={} (\"{}\")",
+            s.exlap_channel, status, s.session_id, s.cred_idx, s.user()
+        ));
+        s.phase = Phase::WaitConnReturn;
+        let xml = format!(r#"<ExlapConnectionRequest session_id="{}"/>"#, s.session_id);
+        host::send(&s.make_pkt(&xml));
     });
 }
 
 /// Intercept the HU's ServiceDiscoveryResponse, find the ExLAP vendor service,
-/// and send a CHANNEL_OPEN_REQUEST to open channel 0x7E.
+/// and send a CHANNEL_OPEN_REQUEST. Resets state on every SDR to handle
+/// reconnections cleanly.
 fn handle_sdr(pkt: &Packet) {
-    // Only act once — when still waiting to open the channel.
-    let phase = with_state(|s| s.phase.clone());
-    if phase != Phase::WaitChanOpen {
-        return;
-    }
-
-    // The payload is [msg_id_hi, msg_id_lo, ...protobuf SDR bytes...].
     if pkt.payload.len() < 2 {
         return;
     }
+    // Payload is [msg_id_hi, msg_id_lo, ...protobuf SDR bytes...].
     let proto = &pkt.payload[2..];
 
-    if let Some(service_id) = find_exlap_service_id(proto) {
-        // service_id IS the channel in Android Auto — use it directly rather
-        // than a hardcoded config value.
-        let channel = service_id as u8;
-        with_state(|s| {
-            s.exlap_channel = channel;
-            host::info(&format!(
-                "exlap-hook: found ExLAP service_id={} in SDR; opening channel {:#04x}",
-                service_id, channel
-            ));
-            let open_pkt = build_chan_open_request(channel, service_id);
-            host::send(&open_pkt);
-            // Stay in WaitChanOpen; advance to WaitConnReturn in handle_control
-            // when we receive MSG_CHANNEL_OPEN_RESPONSE.
-        });
+    match find_exlap_service_id(proto) {
+        None => {
+            host::info("exlap-hook: SDR received — ExLAP service not found");
+        }
+        Some(service_id) => {
+            let channel = service_id as u8;
+            with_state(|s| {
+                // Reset on every SDR — handles phone reconnections gracefully.
+                // Preserve cred_idx (avoid retrying known-bad creds) and subscribe_urls.
+                let cred_idx = s.cred_idx;
+                let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
+                *s = ExlapState::new(channel, cred_idx, subscribe_urls);
+
+                host::info(&format!(
+                    "exlap-hook: SDR found ExLAP service_id={} → ch={:#04x}; \
+                     sending CHANNEL_OPEN_REQUEST",
+                    service_id, channel
+                ));
+                host::send(&build_chan_open_request(channel, service_id));
+            });
+        }
     }
 }
+
+fn handle_xml(xml: &str) {
+    let root = xml_root_tag(xml).unwrap_or_default();
+
+    match root.as_str() {
+        "ExlapBeacon" => {}
+        "ExlapConnectionClosed" => {
+            host::info("exlap-hook: HU closed ExLAP connection");
+            with_state(|s| {
+                // Preserve subscribe_urls and cred_idx across reconnect.
+                let cred_idx = s.cred_idx;
+                let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
+                let channel = s.exlap_channel;
+                *s = ExlapState::new(channel, cred_idx, subscribe_urls);
+                push_connection_state(s);
+            });
+        }
+        "ExlapConnectionReturn" => {
+            with_state(|s| {
+                if s.phase != Phase::WaitConnReturn {
+                    host::info(&format!(
+                        "exlap-hook: unexpected ExlapConnectionReturn in phase {:?}",
+                        s.phase
+                    ));
+                    return;
+                }
+                let connected = xml_attr_in_tag(xml, "ExlapConnectionReturn", "connected")
+                    .map(|v| v == "true")
+                    .unwrap_or(false);
+                if !connected {
+                    host::error("exlap-hook: ExlapConnectionReturn connected=false");
+                    s.phase = Phase::Failed;
+                    push_connection_state(s);
+                    return;
+                }
+                host::info("exlap-hook: ExLAP connection established; waiting for Init");
+                s.phase = Phase::WaitInit;
+                push_connection_state(s);
+            });
+        }
+        "ExlapStatement" => {
+            let sid = xml_attr_in_tag(xml, "ExlapStatement", "session_id").unwrap_or_default();
+            let our_sid = with_state(|s| s.session_id.clone());
+            if sid != our_sid {
+                host::info(&format!(
+                    "exlap-hook: ignoring ExlapStatement session_id={:?} (ours={:?})",
+                    sid, our_sid
+                ));
+                return;
+            }
+            advance_statement(xml);
+        }
+        other => {
+            host::info(&format!("exlap-hook: unknown root element <{}>", other));
+        }
+    }
+}
+
+fn advance_statement(xml: &str) {
+    let phase = with_state(|s| s.phase.clone());
+
+    match phase {
+        Phase::WaitInit => {
+            if xml.contains("<Init") {
+                host::info("exlap-hook: got <Init>; sending Protocol request");
+                with_state(|s| {
+                    let req = s.make_req(r#"<Protocol version="1" returnCapabilities="true"/>"#);
+                    let pkt = s.make_pkt(&req);
+                    s.phase = Phase::WaitCapabilities;
+                    push_connection_state(s);
+                    host::send(&pkt);
+                });
+            }
+        }
+        Phase::WaitCapabilities => {
+            if xml.contains("<Capabilities") {
+                with_state(|s| {
+                    host::info(&format!(
+                        "exlap-hook: got <Capabilities>; sending auth challenge \
+                         cred={} user=\"{}\"",
+                        s.cred_idx,
+                        s.user()
+                    ));
+                    let req = s.make_req(r#"<Authenticate phase="challenge" useHash="sha256"/>"#);
+                    let pkt = s.make_pkt(&req);
+                    s.phase = Phase::WaitAuthChallenge;
+                    host::send(&pkt);
+                });
+            }
+        }
+        Phase::WaitAuthChallenge => {
+            if let Some(nonce_b64) = xml_attr_in_tag(xml, "Challenge", "nonce") {
+                host::info(&format!(
+                    "exlap-hook: got auth challenge (nonce=\"{}\")",
+                    nonce_b64
+                ));
+                with_state(|s| {
+                    match compute_auth_response(&nonce_b64, s.user(), s.password()) {
+                        Ok((cnonce_b64, digest_b64)) => {
+                            host::info(&format!(
+                                "exlap-hook: sending auth response user=\"{}\"",
+                                s.user()
+                            ));
+                            let body = format!(
+                                r#"<Authenticate phase="response" user="{}" cnonce="{}" digest="{}"/>"#,
+                                s.user(), cnonce_b64, digest_b64
+                            );
+                            let req = s.make_req(&body);
+                            let pkt = s.make_pkt(&req);
+                            s.phase = Phase::WaitAuthResponse;
+                            host::send(&pkt);
+                        }
+                        Err(e) => {
+                            host::error(&format!("exlap-hook: auth compute failed: {}", e));
+                        }
+                    }
+                });
+            } else if xml.contains("<Challenge") {
+                host::error("exlap-hook: <Challenge> element has no nonce attribute");
+            }
+        }
+        Phase::WaitAuthResponse => {
+            if xml.contains("<Rsp") {
+                let inner = extract_rsp_inner(xml);
+                let empty = inner.map(|s| !s.trim().contains('<')).unwrap_or(true);
+                if empty {
+                    with_state(|s| {
+                        host::info(&format!(
+                            "exlap-hook: authenticated with cred={} user=\"{}\"",
+                            s.cred_idx,
+                            s.user()
+                        ));
+                        let req = s.make_req("<Dir/>");
+                        let pkt = s.make_pkt(&req);
+                        s.phase = Phase::WaitUrlList;
+                        push_connection_state(s);
+                        host::send(&pkt);
+                    });
+                } else {
+                    let rsp_content = inner.unwrap_or("").trim().to_string();
+                    with_state(|s| {
+                        host::info(&format!(
+                            "exlap-hook: auth failed cred={} user=\"{}\" rsp={:?}",
+                            s.cred_idx,
+                            s.user(),
+                            rsp_content
+                        ));
+                        let next = s.cred_idx + 1;
+                        if next < CREDENTIALS.len() {
+                            host::info(&format!(
+                                "exlap-hook: trying cred={} user=\"{}\"",
+                                next, CREDENTIALS[next].0
+                            ));
+                            s.cred_idx = next;
+                            let req = s.make_req(
+                                r#"<Authenticate phase="challenge" useHash="sha256"/>"#,
+                            );
+                            let pkt = s.make_pkt(&req);
+                            s.phase = Phase::WaitAuthChallenge;
+                            host::send(&pkt);
+                        } else {
+                            host::error(
+                                "exlap-hook: all credentials exhausted; ExLAP auth failed",
+                            );
+                            s.phase = Phase::Failed;
+                            push_connection_state(s);
+                        }
+                    });
+                }
+            }
+        }
+        Phase::WaitUrlList => {
+            if xml.contains("<UrlList") {
+                with_state(|s| {
+                    let urls = parse_url_list(xml);
+                    host::info(&format!(
+                        "exlap-hook: HU exposes {} URLs:",
+                        urls.len()
+                    ));
+                    for entry in &urls {
+                        let url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+                        let typ = entry.get("url_type").and_then(|v| v.as_str()).unwrap_or("?");
+                        host::info(&format!("exlap-hook:   {} ({})", url, typ));
+                    }
+
+                    let snapshot = serde_json::json!({
+                        "connection_state": "active",
+                        "subscription_limit_reached": false,
+                        "urls": urls,
+                        "values": {},
+                    });
+                    host::send_ws_event("exlap", &snapshot.to_string());
+
+                    s.phase = Phase::Active;
+                    s.subscription_limit_reached = false;
+
+                    // Auto-subscribe to configured URLs.
+                    let sub_urls = s.subscribe_urls.clone();
+                    for url in &sub_urls {
+                        let available = urls.iter().any(|e| {
+                            e.get("url").and_then(|v| v.as_str()) == Some(url.as_str())
+                        });
+                        if available {
+                            host::info(&format!("exlap-hook: subscribing to {}", url));
+                            let body =
+                                format!(r#"<Subscribe url="{}" timeStamp="true"/>"#, url);
+                            let req = s.make_req(&body);
+                            host::send(&s.make_pkt(&req));
+                        } else {
+                            host::info(&format!(
+                                "exlap-hook: configured URL \"{}\" not in HU list, skipping",
+                                url
+                            ));
+                        }
+                    }
+                });
+            }
+        }
+        Phase::Active => {
+            if xml.contains("<Rsp") {
+                if let Some(status) = xml_attr_in_tag(xml, "Rsp", "status") {
+                    match status.as_str() {
+                        "subscriptionLimitReached" => {
+                            host::info("exlap-hook: HU subscription limit reached");
+                            with_state(|s| {
+                                s.subscription_limit_reached = true;
+                                push_connection_state(s);
+                            });
+                        }
+                        "noMatchingUrl" => {
+                            host::info("exlap-hook: HU returned noMatchingUrl");
+                        }
+                        other => {
+                            host::info(&format!("exlap-hook: Rsp status={:?}", other));
+                        }
+                    }
+                }
+            }
+            process_dat_messages(xml);
+        }
+        _ => {}
+    }
+}
+
+/// Push a connection state event to the web UI.
+fn push_connection_state(s: &ExlapState) {
+    let event = serde_json::json!({
+        "connection_state": phase_str(&s.phase),
+        "subscription_limit_reached": s.subscription_limit_reached,
+    });
+    host::send_ws_event("exlap", &event.to_string());
+}
+
+fn phase_str(phase: &Phase) -> &'static str {
+    match phase {
+        Phase::Active => "active",
+        Phase::Failed => "failed",
+        _ => "connecting",
+    }
+}
+
+// ── Dat message processing ────────────────────────────────────────────────────
+
+fn process_dat_messages(xml: &str) {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut current_url: Option<String> = None;
+    let mut current_val = String::new();
+    let mut current_val_type = String::new();
+    let mut current_state = String::new();
+    let mut current_timestamp: Option<String> = None;
+    let mut dat_depth: u32 = 0;
+
+    let mut changes: Vec<serde_json::Value> = Vec::new();
+    let mut ev_updated = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let tag = std::str::from_utf8(e.name().local_name().as_ref())
+                    .unwrap_or("")
+                    .to_string();
+                match tag.as_str() {
+                    "Dat" if dat_depth == 0 => {
+                        current_url = attr_value(e, b"url");
+                        current_timestamp = attr_value(e, b"timestamp");
+                        current_val.clear();
+                        current_val_type.clear();
+                        current_state = "ok".to_string();
+                        dat_depth = 1;
+                    }
+                    "Rel" | "Abs" | "Act" | "Enm" | "Txt" | "Tim" | "Bin" if dat_depth == 1 => {
+                        let val = attr_value(e, b"val").unwrap_or_default();
+                        let state =
+                            attr_value(e, b"state").unwrap_or_else(|| "ok".to_string());
+                        current_val_type = tag.clone();
+                        current_val = val.clone();
+                        current_state = state.clone();
+
+                        if state != "nodata" && state != "error" {
+                            if let (Some(url), Ok(v)) =
+                                (current_url.as_deref(), val.parse::<f32>())
+                            {
+                                match url {
+                                    "tankLevelSecondary" => {
+                                        host::info(&format!(
+                                            "exlap-hook: tankLevelSecondary={}%",
+                                            v
+                                        ));
+                                        with_state(|s| s.tank_level = Some(v));
+                                        ev_updated = true;
+                                    }
+                                    "outsideTemperature" => {
+                                        host::info(&format!(
+                                            "exlap-hook: outsideTemperature={}°C",
+                                            v
+                                        ));
+                                        with_state(|s| s.outside_temp = Some(v));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        dat_depth += 1;
+                    }
+                    _ if dat_depth > 0 => {
+                        dat_depth += 1;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let local = e.name().local_name();
+                let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if tag == "Dat" {
+                    if let Some(url) = current_url.take() {
+                        changes.push(serde_json::json!({
+                            "url": url,
+                            "val": current_val,
+                            "type": current_val_type,
+                            "state": current_state,
+                            "timestamp": current_timestamp,
+                        }));
+                    }
+                    dat_depth = 0;
+                } else if dat_depth > 0 {
+                    dat_depth -= 1;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    if ev_updated {
+        let (tank, temp) = with_state(|s| (s.tank_level, s.outside_temp));
+        let body = serde_json::json!({
+            "battery_level_percentage": tank,
+            "external_temp_celsius": temp,
+        });
+        let result = host::rest_call("POST", "/battery", &body.to_string());
+        if !result.contains("\"ok\":true") {
+            host::error(&format!("exlap-hook: POST /battery failed: {}", result));
+        }
+    }
+
+    if !changes.is_empty() {
+        let payload = serde_json::to_string(&changes).unwrap_or_default();
+        host::send_ws_event("exlap", &payload);
+    }
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+/// Compute the ExLAP SHA-256 auth digest.
+///
+/// Matches ExlapReader.java `computeDigest`:
+///   sha256("{user:.44}:{password:.44}:{b64(nonce_bytes):.44}:{b64(cnonce_bytes):.44}") → base64
+fn compute_auth_response(
+    nonce_b64: &str,
+    user: &str,
+    password: &str,
+) -> Result<(String, String), String> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let nonce_bytes = b64.decode(nonce_b64).map_err(|e| e.to_string())?;
+    let nonce_clean = b64.encode(&nonce_bytes);
+
+    let mut cnonce_raw = [0u8; 16];
+    getrandom::getrandom(&mut cnonce_raw).map_err(|e| e.to_string())?;
+    let cnonce_b64 = b64.encode(&cnonce_raw);
+
+    let input = format!(
+        "{:.44}:{:.44}:{:.44}:{:.44}",
+        user, password, nonce_clean, cnonce_b64
+    );
+    let hash = sha2::Sha256::digest(input.as_bytes());
+    let digest_b64 = b64.encode(hash.as_slice());
+
+    Ok((cnonce_b64, digest_b64))
+}
+
+// ── Channel open helpers ──────────────────────────────────────────────────────
 
 /// Build a CHANNEL_OPEN_REQUEST packet for the given channel and service_id.
 fn build_chan_open_request(channel: u8, service_id: i32) -> Packet {
     // Protobuf ChannelOpenRequest { priority: sint32 = 0, service_id: int32 = X }
-    // Field 1 (priority, sint32 zigzag): tag=0x08 value=0x00
-    // Field 2 (service_id, int32):       tag=0x10 value=varint(service_id)
+    // Field 1 (priority, sint32 zigzag): tag=0x08, zigzag(0)=0x00
+    // Field 2 (service_id, int32):       tag=0x10, varint(service_id)
     let mut payload = vec![
         (MSG_CHANNEL_OPEN_REQUEST >> 8) as u8,
         (MSG_CHANNEL_OPEN_REQUEST & 0xFF) as u8,
-        0x08, 0x00, // priority = 0 (zigzag-encoded)
+        0x08, 0x00, // priority = 0
         0x10,       // field 2 tag
     ];
     encode_varint(service_id as u64, &mut payload);
@@ -436,7 +907,7 @@ fn find_exlap_service_id(data: &[u8]) -> Option<i32> {
         let wire = (tag & 0x7) as u8;
         match (field, wire) {
             (1, 2) => {
-                // services: repeated Service (length-delimited)
+                // services: repeated Service
                 let (len, n) = read_varint(data, pos)?;
                 pos += n;
                 let end = pos + len as usize;
@@ -478,13 +949,11 @@ fn parse_service_for_exlap(data: &[u8]) -> Option<i32> {
         let wire = (tag & 0x7) as u8;
         match (field, wire) {
             (1, 0) => {
-                // id: required int32
                 let (v, n) = read_varint(data, pos)?;
                 pos += n;
                 id = Some(v as i32);
             }
             (12, 2) => {
-                // vendor_extension_service: optional VendorExtensionService
                 let (len, n) = read_varint(data, pos)?;
                 pos += n;
                 let end = pos + len as usize;
@@ -513,7 +982,8 @@ fn parse_service_for_exlap(data: &[u8]) -> Option<i32> {
     if is_exlap { id } else { None }
 }
 
-/// Return true if this VendorExtensionService protobuf has service_name == EXLAP_SERVICE_NAME.
+/// Return true if this VendorExtensionService protobuf has
+/// service_name == EXLAP_SERVICE_NAME.
 fn is_exlap_vendor_service(data: &[u8]) -> bool {
     let mut pos = 0;
     while pos < data.len() {
@@ -525,7 +995,6 @@ fn is_exlap_vendor_service(data: &[u8]) -> bool {
         let wire = (tag & 0x7) as u8;
         match (field, wire) {
             (1, 2) => {
-                // service_name: required string
                 let Some((len, n)) = read_varint(data, pos) else {
                     return false;
                 };
@@ -591,377 +1060,6 @@ fn encode_varint(mut v: u64, buf: &mut Vec<u8>) {
         }
         buf.push(byte | 0x80);
     }
-}
-
-fn handle_xml(xml: &str) {
-    let root = xml_root_tag(xml).unwrap_or_default();
-
-    match root.as_str() {
-        "ExlapBeacon" => {}
-        "ExlapConnectionClosed" => {
-            host::info("exlap-hook: server closed ExLAP connection, resetting to WaitInit");
-            with_state(|s| {
-                s.phase = Phase::WaitInit;
-                push_connection_state(s);
-            });
-        }
-        "ExlapConnectionReturn" => {
-            with_state(|s| {
-                if s.phase != Phase::WaitConnReturn {
-                    return;
-                }
-                let connected = xml_attr_in_tag(xml, "ExlapConnectionReturn", "connected")
-                    .map(|v| v == "true")
-                    .unwrap_or(false);
-                if !connected {
-                    host::error("exlap-hook: ExlapConnectionReturn connected=false");
-                    return;
-                }
-                host::info("exlap-hook: ExLAP connection established; waiting for Init");
-                s.phase = Phase::WaitInit;
-                push_connection_state(s);
-            });
-        }
-        "ExlapStatement" => {
-            let sid = xml_attr_in_tag(xml, "ExlapStatement", "session_id").unwrap_or_default();
-            let our_sid = with_state(|s| s.session_id.clone());
-            if sid != our_sid {
-                return;
-            }
-            advance_statement(xml);
-        }
-        other => {
-            host::info(&format!("exlap-hook: ignoring unknown root: {}", other));
-        }
-    }
-}
-
-fn advance_statement(xml: &str) {
-    let phase = with_state(|s| s.phase.clone());
-
-    match phase {
-        Phase::WaitInit => {
-            if xml.contains("<Init") {
-                host::info("exlap-hook: got Init; sending Protocol request");
-                with_state(|s| {
-                    let req = s.make_req(r#"<Protocol version="1" returnCapabilities="true"/>"#);
-                    let pkt = s.make_pkt(&req);
-                    s.phase = Phase::WaitCapabilities;
-                    push_connection_state(s);
-                    host::send(&pkt);
-                });
-            }
-        }
-        Phase::WaitCapabilities => {
-            if xml.contains("<Capabilities") {
-                with_state(|s| {
-                    host::info(&format!(
-                        "exlap-hook: got Capabilities; sending auth challenge (cred={} \"{}\")",
-                        s.cred_idx,
-                        s.user()
-                    ));
-                    // KEY FIX: include useHash="sha256" so the HU knows which algorithm we use
-                    let req = s.make_req(r#"<Authenticate phase="challenge" useHash="sha256"/>"#);
-                    let pkt = s.make_pkt(&req);
-                    s.phase = Phase::WaitAuthChallenge;
-                    host::send(&pkt);
-                });
-            }
-        }
-        Phase::WaitAuthChallenge => {
-            if let Some(nonce_b64) = xml_attr_in_tag(xml, "Challenge", "nonce") {
-                with_state(|s| {
-                    match compute_auth_response(&nonce_b64, s.user(), s.password()) {
-                        Ok((cnonce_b64, digest_b64)) => {
-                            let body = format!(
-                                r#"<Authenticate phase="response" user="{}" cnonce="{}" digest="{}"/>"#,
-                                s.user(),
-                                cnonce_b64,
-                                digest_b64
-                            );
-                            let req = s.make_req(&body);
-                            let pkt = s.make_pkt(&req);
-                            s.phase = Phase::WaitAuthResponse;
-                            host::send(&pkt);
-                        }
-                        Err(e) => {
-                            host::error(&format!("exlap-hook: auth compute failed: {}", e));
-                        }
-                    }
-                });
-            }
-        }
-        Phase::WaitAuthResponse => {
-            if xml.contains("<Rsp") {
-                let empty = match extract_rsp_inner(xml) {
-                    None => true,
-                    Some(inner) => !inner.trim().contains('<'),
-                };
-                if empty {
-                    // Auth success
-                    with_state(|s| {
-                        host::info(&format!(
-                            "exlap-hook: authenticated with cred={} (\"{}\")",
-                            s.cred_idx,
-                            s.user()
-                        ));
-                        let req = s.make_req("<Dir/>");
-                        let pkt = s.make_pkt(&req);
-                        s.phase = Phase::WaitUrlList;
-                        push_connection_state(s);
-                        host::send(&pkt);
-                    });
-                } else {
-                    // Auth failure — try next credential
-                    with_state(|s| {
-                        let next = s.cred_idx + 1;
-                        if next < CREDENTIALS.len() {
-                            host::info(&format!(
-                                "exlap-hook: cred={} failed; trying cred={}",
-                                s.cred_idx, next
-                            ));
-                            s.cred_idx = next;
-                            // Re-issue challenge for fresh nonce
-                            let req = s
-                                .make_req(r#"<Authenticate phase="challenge" useHash="sha256"/>"#);
-                            let pkt = s.make_pkt(&req);
-                            s.phase = Phase::WaitAuthChallenge;
-                            host::send(&pkt);
-                        } else {
-                            host::error("exlap-hook: all credentials exhausted; ExLAP auth permanently failed");
-                            s.phase = Phase::Failed;
-                            push_connection_state(s);
-                        }
-                    });
-                }
-            }
-        }
-        Phase::WaitUrlList => {
-            if xml.contains("<UrlList") {
-                with_state(|s| {
-                    let urls = parse_url_list(xml);
-                    host::info(&format!("exlap-hook: HU exposes {} URLs", urls.len()));
-
-                    // Push full state snapshot to web UI
-                    let snapshot = serde_json::json!({
-                        "connection_state": "active",
-                        "subscription_limit_reached": false,
-                        "urls": urls,
-                        "values": {},
-                    });
-                    host::send_ws_event("exlap", &snapshot.to_string());
-
-                    s.phase = Phase::Active;
-                    s.subscription_limit_reached = false;
-
-                    // Subscribe to EV fields automatically
-                    let ev_urls = ["tankLevelSecondary", "outsideTemperature"];
-                    for &url in &ev_urls {
-                        if urls.is_empty() || urls.iter().any(|e: &serde_json::Value| {
-                            e.get("url").and_then(|v| v.as_str()) == Some(url)
-                        }) {
-                            let body = format!(r#"<Subscribe url="{}" timeStamp="true"/>"#, url);
-                            let req = s.make_req(&body);
-                            let pkt = s.make_pkt(&req);
-                            host::send(&pkt);
-                        }
-                    }
-                });
-            }
-        }
-        Phase::Active => {
-            // Check for subscription limit or other Rsp status codes
-            if xml.contains("<Rsp") {
-                if let Some(status) = xml_attr_in_tag(xml, "Rsp", "status") {
-                    match status.as_str() {
-                        "subscriptionLimitReached" => {
-                            host::info("exlap-hook: subscription limit reached");
-                            with_state(|s| {
-                                s.subscription_limit_reached = true;
-                                push_connection_state(s);
-                            });
-                        }
-                        "noMatchingUrl" => {
-                            host::info("exlap-hook: HU returned noMatchingUrl");
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            process_dat_messages(xml);
-        }
-        _ => {}
-    }
-}
-
-/// Push a connection state event to the web UI.
-fn push_connection_state(s: &ExlapState) {
-    let state_str = phase_str(&s.phase);
-    let event = serde_json::json!({
-        "connection_state": state_str,
-        "subscription_limit_reached": s.subscription_limit_reached,
-    });
-    host::send_ws_event("exlap", &event.to_string());
-}
-
-fn phase_str(phase: &Phase) -> &'static str {
-    match phase {
-        Phase::Active => "active",
-        Phase::Failed => "failed",
-        Phase::WaitChanOpen => "connecting",
-        _ => "connecting",
-    }
-}
-
-// ── Dat message processing ────────────────────────────────────────────────────
-
-fn process_dat_messages(xml: &str) {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut current_url: Option<String> = None;
-    let mut current_val = String::new();
-    let mut current_val_type = String::new();
-    let mut current_state = String::new();
-    let mut current_timestamp: Option<String> = None;
-    let mut dat_depth: u32 = 0;
-
-    let mut changes: Vec<serde_json::Value> = Vec::new();
-    let mut ev_updated = false;
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                let tag = std::str::from_utf8(e.name().local_name().as_ref())
-                    .unwrap_or("")
-                    .to_string();
-                match tag.as_str() {
-                    "Dat" if dat_depth == 0 => {
-                        current_url = attr_value(e, b"url");
-                        current_timestamp = attr_value(e, b"timestamp");
-                        current_val.clear();
-                        current_val_type.clear();
-                        current_state = "ok".to_string();
-                        dat_depth = 1;
-                    }
-                    "Rel" | "Abs" | "Act" | "Enm" | "Txt" | "Tim" | "Bin" if dat_depth == 1 => {
-                        let val = attr_value(e, b"val").unwrap_or_default();
-                        let state =
-                            attr_value(e, b"state").unwrap_or_else(|| "ok".to_string());
-                        current_val_type = tag.clone();
-                        current_val = val.clone();
-                        current_state = state.clone();
-
-                        // EV telemetry handling
-                        if state != "nodata" && state != "error" {
-                            if let (Some(url), Ok(v)) =
-                                (current_url.as_deref(), val.parse::<f32>())
-                            {
-                                match url {
-                                    "tankLevelSecondary" => {
-                                        host::info(&format!(
-                                            "exlap-hook: tankLevelSecondary = {}%",
-                                            v
-                                        ));
-                                        with_state(|s| {
-                                            s.tank_level = Some(v);
-                                        });
-                                        ev_updated = true;
-                                    }
-                                    "outsideTemperature" => {
-                                        host::info(&format!(
-                                            "exlap-hook: outsideTemperature = {}°C",
-                                            v
-                                        ));
-                                        with_state(|s| {
-                                            s.outside_temp = Some(v);
-                                        });
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        dat_depth += 1;
-                    }
-                    _ if dat_depth > 0 => {
-                        dat_depth += 1;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::End(ref e)) => {
-                let local = e.name().local_name();
-                let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
-                if tag == "Dat" {
-                    if let Some(url) = current_url.take() {
-                        changes.push(serde_json::json!({
-                            "url": url,
-                            "val": current_val,
-                            "type": current_val_type,
-                            "state": current_state,
-                            "timestamp": current_timestamp,
-                        }));
-                    }
-                    dat_depth = 0;
-                } else if dat_depth > 0 {
-                    dat_depth -= 1;
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-
-    if ev_updated {
-        // POST EV data to /battery (on the WASM REST whitelist)
-        let (tank, temp) = with_state(|s| (s.tank_level, s.outside_temp));
-        let body = serde_json::json!({
-            "battery_level_percentage": tank,
-            "external_temp_celsius": temp,
-        });
-        let result = host::rest_call("POST", "/battery", &body.to_string());
-        if !result.contains("\"ok\":true") {
-            host::error(&format!("exlap-hook: /battery POST failed: {}", result));
-        }
-    }
-
-    if !changes.is_empty() {
-        let payload = serde_json::to_string(&changes).unwrap_or_default();
-        host::send_ws_event("exlap", &payload);
-    }
-}
-
-// ── Auth ──────────────────────────────────────────────────────────────────────
-
-/// Compute the ExLAP SHA-256 auth digest.
-///
-/// Matches ExlapReader.java `computeDigest`:
-///   sha256("{user:.44}:{password:.44}:{b64(nonce_bytes):.44}:{b64(cnonce_bytes):.44}") → base64
-fn compute_auth_response(
-    nonce_b64: &str,
-    user: &str,
-    password: &str,
-) -> Result<(String, String), String> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    let nonce_bytes = b64.decode(nonce_b64).map_err(|e| e.to_string())?;
-    let nonce_clean = b64.encode(&nonce_bytes);
-
-    let mut cnonce_raw = [0u8; 16];
-    getrandom::getrandom(&mut cnonce_raw).map_err(|e| e.to_string())?;
-    let cnonce_b64 = b64.encode(&cnonce_raw);
-
-    let input = format!(
-        "{:.44}:{:.44}:{:.44}:{:.44}",
-        user, password, nonce_clean, cnonce_b64
-    );
-    let hash = sha2::Sha256::digest(input.as_bytes());
-    let digest_b64 = b64.encode(hash.as_slice());
-
-    Ok((cnonce_b64, digest_b64))
 }
 
 // ── XML helpers ───────────────────────────────────────────────────────────────
@@ -1042,7 +1140,7 @@ fn extract_rsp_inner(xml: &str) -> Option<&str> {
     let after_bracket = xml[start..].find('>')?;
     let open_end = start + after_bracket;
     if xml.as_bytes().get(open_end.saturating_sub(1)) == Some(&b'/') {
-        return None;
+        return None; // self-closing
     }
     let content_start = open_end + 1;
     let close = xml.find("</Rsp>")?;
