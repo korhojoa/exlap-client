@@ -385,12 +385,16 @@ fn handle_sdr(pkt: &Packet) {
     let proto = &pkt.payload[2..];
 
     if let Some(service_id) = find_exlap_service_id(proto) {
+        // service_id IS the channel in Android Auto — use it directly rather
+        // than a hardcoded config value.
+        let channel = service_id as u8;
         with_state(|s| {
+            s.exlap_channel = channel;
             host::info(&format!(
                 "exlap-hook: found ExLAP service_id={} in SDR; opening channel {:#04x}",
-                service_id, s.exlap_channel
+                service_id, channel
             ));
-            let open_pkt = build_chan_open_request(s.exlap_channel, service_id);
+            let open_pkt = build_chan_open_request(channel, service_id);
             host::send(&open_pkt);
             // Stay in WaitChanOpen; advance to WaitConnReturn in handle_control
             // when we receive MSG_CHANNEL_OPEN_RESPONSE.
