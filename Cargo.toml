@@ -1,0 +1,23 @@
+[package]
+name = "exlap-hook"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# SHA-256 — pure Rust, works in WASM
+sha2 = "0.10"
+# Base64 encoding/decoding — replaces openssl::base64
+base64 = "0.22"
+# CSPRNG via WASI random_get — replaces openssl::rand::rand_bytes
+getrandom = { version = "0.2" }
+wit-bindgen-rt = "0.41"
+# XML parsing — same approach as native exlap.rs
+quick-xml = "0.36"
+# JSON serialisation for event payloads and REST bodies
+serde_json = "1"
+
+[package.metadata.component]
+package = "aa:exlap-hook"
