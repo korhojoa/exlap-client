@@ -198,6 +198,18 @@ impl Guest for ExlapHook {
     }
 
     fn on_destroy() {
+        // Send <Bye/> so the HU cleans up the session (spec §3.5.8: client SHOULD send Bye).
+        let active = with_state(|s| {
+            matches!(s.phase, Phase::Active | Phase::WaitUrlList | Phase::WaitAuthResponse
+                | Phase::WaitAuthChallenge | Phase::WaitCapabilities | Phase::WaitInit
+                | Phase::WaitConnReturn)
+        });
+        if active {
+            with_state(|s| {
+                let req = s.make_req("<Bye/>");
+                host::send(&s.make_pkt(&req));
+            });
+        }
         host::info("exlap-hook: destroyed");
     }
 
@@ -671,6 +683,14 @@ fn advance_statement(xml: &str) {
                             s.cred_idx,
                             s.user()
                         ));
+                        // Spec §3.5.9: disable server heartbeat so the HU doesn't send
+                        // periodic <Status><Alive/> messages we have to track.
+                        // If the HU doesn't support <Heartbeat/> it returns notImplemented
+                        // (handled gracefully in Active phase) and we fall back to responding
+                        // to any Alive pings that arrive.
+                        let hb_req = s.make_req("<Heartbeat ival=\"0\"/>");
+                        host::send(&s.make_pkt(&hb_req));
+
                         let body = r#"<Dir urlPattern="*" fromEntry="1" numOfEntries="999999999"/>"#;
                         let req = s.make_req(body);
                         let pkt = s.make_pkt(&req);
@@ -810,9 +830,8 @@ fn process_dat_messages(xml: &str) {
     reader.config_mut().trim_text(true);
 
     let mut current_url: Option<String> = None;
-    let mut current_val = String::new();
-    let mut current_val_type = String::new();
-    let mut current_state = String::new();
+    // Collect all fields per Dat object (spec shows multi-field objects like WGS84Position).
+    let mut current_fields: Vec<serde_json::Value> = Vec::new();
     let mut current_timestamp: Option<String> = None;
     let mut dat_depth: u32 = 0;
 
@@ -829,18 +848,14 @@ fn process_dat_messages(xml: &str) {
                     "Dat" if dat_depth == 0 => {
                         current_url = attr_value(e, b"url");
                         current_timestamp = attr_value(e, b"timeStamp");
-                        current_val.clear();
-                        current_val_type.clear();
-                        current_state = "ok".to_string();
+                        current_fields.clear();
                         dat_depth = 1;
                     }
                     "Rel" | "Abs" | "Act" | "Enm" | "Txt" | "Tim" | "Bin" if dat_depth == 1 => {
+                        let name = attr_value(e, b"name").unwrap_or_default();
                         let val = attr_value(e, b"val").unwrap_or_default();
                         let state =
                             attr_value(e, b"state").unwrap_or_else(|| "ok".to_string());
-                        current_val_type = tag.clone();
-                        current_val = val.clone();
-                        current_state = state.clone();
 
                         if state != "nodata" && state != "error" {
                             if let (Some(url), Ok(v)) =
@@ -866,6 +881,12 @@ fn process_dat_messages(xml: &str) {
                                 }
                             }
                         }
+                        current_fields.push(serde_json::json!({
+                            "name": name,
+                            "type": tag,
+                            "val": val,
+                            "state": state,
+                        }));
                         dat_depth += 1;
                     }
                     _ if dat_depth > 0 => {
@@ -881,11 +902,10 @@ fn process_dat_messages(xml: &str) {
                     if let Some(url) = current_url.take() {
                         changes.push(serde_json::json!({
                             "url": url,
-                            "val": current_val,
-                            "type": current_val_type,
-                            "state": current_state,
+                            "fields": current_fields.clone(),
                             "timestamp": current_timestamp,
                         }));
+                        current_fields.clear();
                     }
                     dat_depth = 0;
                 } else if dat_depth > 0 {
