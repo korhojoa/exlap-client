@@ -923,10 +923,11 @@ fn process_dat_messages(xml: &str) {
             "battery_level_percentage": tank,
             "external_temp_celsius": temp,
         });
-        let result = host::rest_call("POST", "/battery", &body.to_string());
-        if !result.contains("\"ok\":true") {
-            host::error(&format!("exlap-hook: POST /battery failed: {}", result));
-        }
+        // Use rest_call_async so the HTTP POST to /battery doesn't block modify_packet.
+        // ureq has no default timeout; a slow local server would otherwise exceed the
+        // packet_epoch_deadline (100 epochs × 10 ms = 1 s) and corrupt the epoch state.
+        // The result is delivered as a WS event which we don't need to act on.
+        host::rest_call_async("POST", "/battery", &body.to_string());
     }
 
     if !changes.is_empty() {
