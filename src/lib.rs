@@ -34,10 +34,22 @@ use std::sync::{Mutex, OnceLock};
 // ── Credentials (from ExlapReader.java, in index order) ──────────────────────
 
 const CREDENTIALS: &[(&str, &str)] = &[
-    ("Test_TB-105000", "s4T2K6BAv0a7LQvrv3vdaUl17xEl2WJOpTmAThpRZe0=="),
-    ("RSE_L-CA2000", "T53Facvq51jO8vQJrBNx3MqLWmPcHf/hkow7yLu7SuA=="),
-    ("RSE_3-DE1400", "KozPo8iE0j72pkbWXKcP0QihpxgML3Opp8fNJZ0wN24="),
-    ("ML_74-125000", "Fo7arEpPhAgMMznzxRlV8B7eeZgNDIYQcy0Gr7Ad1Fg=="),
+    (
+        "Test_TB-105000",
+        "s4T2K6BAv0a7LQvrv3vdaUl17xEl2WJOpTmAThpRZe0==",
+    ),
+    (
+        "RSE_L-CA2000",
+        "T53Facvq51jO8vQJrBNx3MqLWmPcHf/hkow7yLu7SuA==",
+    ),
+    (
+        "RSE_3-DE1400",
+        "KozPo8iE0j72pkbWXKcP0QihpxgML3Opp8fNJZ0wN24==",
+    ),
+    (
+        "ML_74-125000",
+        "Fo7arEpPhAgMMznzxRlV8B7eeZgNDIYQcy0Gr7Ad1Fg==",
+    ),
 ];
 
 const DEFAULT_SUBSCRIBE_URLS: &str = "tankLevelSecondary,outsideTemperature";
@@ -46,7 +58,7 @@ const DEFAULT_SUBSCRIBE_URLS: &str = "tankLevelSecondary,outsideTemperature";
 
 const ENCRYPTED: u8 = 1 << 3;
 const FRAME_TYPE_FIRST: u8 = 1 << 0; // bit 0, matches mitm.rs
-const FRAME_TYPE_LAST: u8 = 1 << 1;  // bit 1, matches mitm.rs
+const FRAME_TYPE_LAST: u8 = 1 << 1; // bit 1, matches mitm.rs
 const CONTROL_FLAG: u8 = 1 << 2;
 
 const MSG_SERVICE_DISCOVERY_RESPONSE: u16 = 6;
@@ -93,6 +105,14 @@ struct ExlapState {
     subscription_limit_reached: bool,
     /// URLs to auto-subscribe to after URL list is received (configurable).
     subscribe_urls: Vec<String>,
+    /// Frames queued for transmission toward the HU. host::send routes to the
+    /// *current* proxy task's endpoint, and only the MD task reaches the HU, so
+    /// we cannot send directly from the (HU-originated) packets that drive the
+    /// state machine. Instead we enqueue here and flush from a dir=MD invocation.
+    outbound: Vec<Packet>,
+    /// XML payloads we recently emitted, so we can recognise and skip our own
+    /// frames when they re-enter the hook after being sent (Forward re-traversal).
+    recently_sent: Vec<String>,
 }
 
 impl ExlapState {
@@ -108,7 +128,20 @@ impl ExlapState {
             outside_temp: None,
             subscription_limit_reached: false,
             subscribe_urls,
+            outbound: Vec::new(),
+            recently_sent: Vec::new(),
         }
+    }
+
+    /// Queue an ExLAP XML frame for transmission toward the HU. See `outbound`.
+    /// Records the payload so the frame is skipped when it re-enters the hook.
+    fn send_xml(&mut self, xml: &str) {
+        let pkt = self.make_pkt(xml);
+        self.recently_sent.push(xml.to_string());
+        if self.recently_sent.len() > 16 {
+            self.recently_sent.remove(0);
+        }
+        self.outbound.push(pkt);
     }
 
     fn next_id(&mut self) -> u32 {
@@ -193,16 +226,27 @@ impl Guest for ExlapHook {
         ));
 
         STATE
-            .set(Mutex::new(ExlapState::new(channel, start_cred, subscribe_urls)))
+            .set(Mutex::new(ExlapState::new(
+                channel,
+                start_cred,
+                subscribe_urls,
+            )))
             .ok();
     }
 
     fn on_destroy() {
         // Send <Bye/> so the HU cleans up the session (spec §3.5.8: client SHOULD send Bye).
         let active = with_state(|s| {
-            matches!(s.phase, Phase::Active | Phase::WaitUrlList | Phase::WaitAuthResponse
-                | Phase::WaitAuthChallenge | Phase::WaitCapabilities | Phase::WaitInit
-                | Phase::WaitConnReturn)
+            matches!(
+                s.phase,
+                Phase::Active
+                    | Phase::WaitUrlList
+                    | Phase::WaitAuthResponse
+                    | Phase::WaitAuthChallenge
+                    | Phase::WaitCapabilities
+                    | Phase::WaitInit
+                    | Phase::WaitConnReturn
+            )
         });
         if active {
             with_state(|s| {
@@ -274,6 +318,15 @@ impl Guest for ExlapHook {
     }
 
     fn modify_packet(_ctx: ModifyContext, pkt: Packet, _cfg: ConfigView) -> Decision {
+        // Flush any queued ExLAP frames toward the HU. host::send routes to the
+        // current proxy task's endpoint, and only the MD task (dir=MD) reaches
+        // the HU — so we can only emit during a dir=MD invocation. Any dir=MD
+        // packet is a usable carrier (phone→HU video is a constant stream), so
+        // flush latency is negligible. Done before the channel filter on purpose.
+        if pkt.proxy_type == ProxyType::MobileDevice {
+            flush_outbound();
+        }
+
         // Intercept the HU's ServiceDiscoveryResponse so we can open the ExLAP
         // channel ourselves — no host-side ExLAP code required.
         if pkt.proxy_type == ProxyType::HeadUnit
@@ -290,7 +343,15 @@ impl Guest for ExlapHook {
         }
 
         process_packet(pkt);
-        Decision::Drop
+        // NEVER return Decision::Drop here. In this host build a wasm "Drop" is
+        // not a discard: run_wasm_hooks maps it to PacketAction::SendBack, which
+        // re-queues the packet into the *other* proxy task's rx arm — where this
+        // same hook runs again and drops it again, forever (confirmed: a single
+        // injected CHANNEL_OPEN_REQUEST ping-ponged the two tasks in a tight
+        // busy-loop, starving the shared proxy task and stalling video). Forward
+        // terminates (encrypt + transmit), so every packet passes through the
+        // hook a bounded number of times. We consume purely via side-effects.
+        Decision::Forward
     }
 
     fn ws_script_handler(topic: String, payload: String) -> String {
@@ -316,7 +377,7 @@ impl Guest for ExlapHook {
                     }
                     let body = format!(r#"<Subscribe url="{}" timeStamp="true"/>"#, url);
                     let xml = s.make_req(&body);
-                    host::send(&s.make_pkt(&xml));
+                    s.send_xml(&xml);
                     host::info(&format!("exlap-hook: ws subscribe → {}", url));
                     "ok".to_string()
                 })
@@ -332,7 +393,7 @@ impl Guest for ExlapHook {
                     }
                     let body = format!(r#"<Unsubscribe url="{}"/>"#, url);
                     let xml = s.make_req(&body);
-                    host::send(&s.make_pkt(&xml));
+                    s.send_xml(&xml);
                     host::info(&format!("exlap-hook: ws unsubscribe → {}", url));
                     "ok".to_string()
                 })
@@ -355,10 +416,27 @@ bindings::export!(ExlapHook with_types_in bindings);
 
 // ── Packet processing ─────────────────────────────────────────────────────────
 
+fn dir_str(pt: ProxyType) -> &'static str {
+    match pt {
+        ProxyType::HeadUnit => "HU",
+        ProxyType::MobileDevice => "MD",
+    }
+}
+
 fn process_packet(pkt: Packet) {
     let is_control = (pkt.packet_flags & CONTROL_FLAG) != 0;
+    let dir = dir_str(pkt.proxy_type);
 
     if is_control {
+        let msg_id = pkt
+            .payload
+            .get(0..2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+            .unwrap_or(0);
+        host::info(&format!(
+            "exlap-hook: ch pkt dir={} CONTROL msg_id={:#06x}",
+            dir, msg_id
+        ));
         handle_control(&pkt);
         return;
     }
@@ -391,7 +469,66 @@ fn process_packet(pkt: Packet) {
         return;
     };
 
+    // A frame we ourselves emitted, re-entering after host::send + Forward
+    // re-traversal. Skip it so we don't parse our own requests as responses.
+    let is_echo = with_state(|s| s.recently_sent.iter().any(|p| p.as_str() == xml.as_str()));
+    if is_echo {
+        host::info(&format!(
+            "exlap-hook: ch DATA dir={} (our own frame echoed back, skipped): {}",
+            dir,
+            truncate_xml(&xml, 160)
+        ));
+        return;
+    }
+
+    // Only drive the state machine from HU-originated frames. Every HU response
+    // is seen twice: once as dir=HU (ingress from the HU) and again as dir=MD
+    // when we Forward that same frame on toward the phone. Acting on both would
+    // process every message twice — e.g. the dir=MD echo of the auth Challenge
+    // would hit the WaitAuthResponse handler and be misread as a failed auth,
+    // racing ahead of the real dir=HU response. Real ExLAP responses are always
+    // dir=HU (the HU is the server), so ignore the dir=MD duplicates.
+    if pkt.proxy_type != ProxyType::HeadUnit {
+        host::info(&format!(
+            "exlap-hook: ch DATA dir={} (forwarded HU→phone duplicate, not acted on): {}",
+            dir,
+            truncate_xml(&xml, 120)
+        ));
+        return;
+    }
+
+    host::info(&format!(
+        "exlap-hook: ch DATA dir={} xml: {}",
+        dir,
+        truncate_xml(&xml, 480)
+    ));
     handle_xml(&xml);
+}
+
+/// Truncate a string to at most `n` characters for logging (ExLAP XML is ASCII).
+fn truncate_xml(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(n).collect();
+        format!("{}…(+{} chars)", head, s.chars().count() - n)
+    }
+}
+
+/// Flush queued outbound ExLAP frames toward the HU. MUST only be called from a
+/// dir=MD invocation (see `outbound` / `modify_packet`).
+fn flush_outbound() {
+    let pkts = with_state(|s| std::mem::take(&mut s.outbound));
+    if pkts.is_empty() {
+        return;
+    }
+    host::info(&format!(
+        "exlap-hook: flushing {} queued frame(s) → HU",
+        pkts.len()
+    ));
+    for p in &pkts {
+        host::send(p);
+    }
 }
 
 /// Handle a control-flag packet on the ExLAP channel.
@@ -403,8 +540,9 @@ fn handle_control(pkt: &Packet) {
 
     if msg_id != MSG_CHANNEL_OPEN_RESPONSE {
         host::info(&format!(
-            "exlap-hook: control msg_id={:#06x} on ExLAP channel (ignored)",
-            msg_id
+            "exlap-hook: control msg_id={:#06x} dir={} on ExLAP channel (forwarded, not consumed)",
+            msg_id,
+            dir_str(pkt.proxy_type)
         ));
         return;
     }
@@ -437,11 +575,15 @@ fn handle_control(pkt: &Packet) {
         host::info(&format!(
             "exlap-hook: channel {:#04x} open (status={}); \
              sending ExlapConnectionRequest session_id={} cred={} (\"{}\")",
-            s.exlap_channel, status, s.session_id, s.cred_idx, s.user()
+            s.exlap_channel,
+            status,
+            s.session_id,
+            s.cred_idx,
+            s.user()
         ));
         s.phase = Phase::WaitConnReturn;
         let xml = format!(r#"<ExlapConnectionRequest session_id="{}"/>"#, s.session_id);
-        host::send(&s.make_pkt(&xml));
+        s.send_xml(&xml);
     });
 }
 
@@ -468,12 +610,18 @@ fn handle_sdr(pkt: &Packet) {
                 let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
                 *s = ExlapState::new(channel, cred_idx, subscribe_urls);
 
+                // We do NOT open the channel ourselves: the phone (Gearhead)
+                // opens every SDR-advertised service, including this one, and the
+                // HU's CHANNEL_OPEN_RESPONSE to *that* is what drives us into
+                // WaitConnReturn (see handle_control). Sending our own open here
+                // would (a) go the wrong way — handle_sdr runs in the HU task, so
+                // host::send reaches the phone, not the HU — and (b) risk a
+                // double-open on a channel the phone already opened.
                 host::info(&format!(
                     "exlap-hook: SDR found ExLAP service_id={} → ch={:#04x}; \
-                     sending CHANNEL_OPEN_REQUEST",
+                     waiting for phone to open the channel",
                     service_id, channel
                 ));
-                host::send(&build_chan_open_request(channel, service_id));
             });
         }
     }
@@ -545,8 +693,8 @@ fn handle_status_element(xml: &str) {
     if xml.contains("Alive") {
         with_state(|s| {
             let req = s.make_req("<Alive/>");
-            host::send(&s.make_pkt(&req));
-            host::info("exlap-hook: Alive ping → sent <Alive/>");
+            s.send_xml(&req);
+            host::info("exlap-hook: Alive ping → queued <Alive/>");
         });
     } else if xml.contains("Bye") {
         host::info("exlap-hook: HU sent Bye via Status element; resetting");
@@ -562,10 +710,9 @@ fn handle_status_element(xml: &str) {
         host::info("exlap-hook: got bare <Status>Init</Status>; sending Protocol request");
         with_state(|s| {
             let req = s.make_req(r#"<Protocol version="1" returnCapabilities="true"/>"#);
-            let pkt = s.make_pkt(&req);
             s.phase = Phase::WaitCapabilities;
             push_connection_state(s);
-            host::send(&pkt);
+            s.send_xml(&req);
         });
     } else if xml.contains("Dataloss") {
         host::info("exlap-hook: HU reported Dataloss on ExLAP channel");
@@ -580,7 +727,7 @@ fn advance_statement(xml: &str) {
     if xml.contains(">Alive<") || xml.contains("<Alive") {
         with_state(|s| {
             let req = s.make_req("<Alive/>");
-            host::send(&s.make_pkt(&req));
+            s.send_xml(&req);
         });
         // Don't return — the packet may also contain other elements.
         return;
@@ -609,10 +756,9 @@ fn advance_statement(xml: &str) {
                 host::info("exlap-hook: got <Init>; sending Protocol request");
                 with_state(|s| {
                     let req = s.make_req(r#"<Protocol version="1" returnCapabilities="true"/>"#);
-                    let pkt = s.make_pkt(&req);
                     s.phase = Phase::WaitCapabilities;
                     push_connection_state(s);
-                    host::send(&pkt);
+                    s.send_xml(&req);
                 });
             }
         }
@@ -637,9 +783,8 @@ fn advance_statement(xml: &str) {
                         ));
                     }
                     let req = s.make_req(r#"<Authenticate phase="challenge" useHash="sha256"/>"#);
-                    let pkt = s.make_pkt(&req);
                     s.phase = Phase::WaitAuthChallenge;
-                    host::send(&pkt);
+                    s.send_xml(&req);
                 });
             }
         }
@@ -649,8 +794,8 @@ fn advance_statement(xml: &str) {
                     "exlap-hook: got auth challenge (nonce=\"{}\")",
                     nonce_b64
                 ));
-                with_state(|s| {
-                    match compute_auth_response(&nonce_b64, s.user(), s.password()) {
+                with_state(
+                    |s| match compute_auth_response(&nonce_b64, s.user(), s.password()) {
                         Ok((cnonce_b64, digest_b64)) => {
                             host::info(&format!(
                                 "exlap-hook: sending auth response user=\"{}\"",
@@ -658,26 +803,36 @@ fn advance_statement(xml: &str) {
                             ));
                             let body = format!(
                                 r#"<Authenticate phase="response" user="{}" cnonce="{}" digest="{}"/>"#,
-                                s.user(), cnonce_b64, digest_b64
+                                s.user(),
+                                cnonce_b64,
+                                digest_b64
                             );
                             let req = s.make_req(&body);
-                            let pkt = s.make_pkt(&req);
                             s.phase = Phase::WaitAuthResponse;
-                            host::send(&pkt);
+                            s.send_xml(&req);
                         }
                         Err(e) => {
                             host::error(&format!("exlap-hook: auth compute failed: {}", e));
                         }
-                    }
-                });
+                    },
+                );
             } else if xml.contains("<Challenge") {
                 host::error("exlap-hook: <Challenge> element has no nonce attribute");
             }
         }
         Phase::WaitAuthResponse => {
-            if xml.contains("<Rsp") {
+            // Auth result is a bare <Rsp id=N/> (no status attribute) on success,
+            // matching ExlapReader.java (empty Rsp = authenticated); failure is
+            // <Rsp ... status="authenticationFailed"/>. Skip the Challenge <Rsp>,
+            // which belongs to WaitAuthChallenge.
+            if xml.contains("<Rsp") && !xml.contains("<Challenge") {
                 let status = xml_attr_in_tag(xml, "Rsp", "status").unwrap_or_default();
-                if status == "ok" {
+                // Success = no error status AND an empty <Rsp> body. This is the
+                // union of our HU's behaviour (failure carries status=
+                // "authenticationFailed", success is a bare <Rsp/>) and
+                // ExlapReader.java's test (success = Rsp with zero child nodes).
+                let ok = (status.is_empty() || status == "ok") && !rsp_has_children(xml);
+                if ok {
                     with_state(|s| {
                         host::info(&format!(
                             "exlap-hook: authenticated with cred={} user=\"{}\"",
@@ -690,14 +845,14 @@ fn advance_statement(xml: &str) {
                         // (handled gracefully in Active phase) and we fall back to responding
                         // to any Alive pings that arrive.
                         let hb_req = s.make_req("<Heartbeat ival=\"0\"/>");
-                        host::send(&s.make_pkt(&hb_req));
+                        s.send_xml(&hb_req);
 
-                        let body = r#"<Dir urlPattern="*" fromEntry="1" numOfEntries="999999999"/>"#;
+                        let body =
+                            r#"<Dir urlPattern="*" fromEntry="1" numOfEntries="999999999"/>"#;
                         let req = s.make_req(body);
-                        let pkt = s.make_pkt(&req);
                         s.phase = Phase::WaitUrlList;
                         push_connection_state(s);
-                        host::send(&pkt);
+                        s.send_xml(&req);
                     });
                 } else {
                     with_state(|s| {
@@ -714,16 +869,12 @@ fn advance_statement(xml: &str) {
                                 next, CREDENTIALS[next].0
                             ));
                             s.cred_idx = next;
-                            let req = s.make_req(
-                                r#"<Authenticate phase="challenge" useHash="sha256"/>"#,
-                            );
-                            let pkt = s.make_pkt(&req);
+                            let req =
+                                s.make_req(r#"<Authenticate phase="challenge" useHash="sha256"/>"#);
                             s.phase = Phase::WaitAuthChallenge;
-                            host::send(&pkt);
+                            s.send_xml(&req);
                         } else {
-                            host::error(
-                                "exlap-hook: all credentials exhausted; ExLAP auth failed",
-                            );
+                            host::error("exlap-hook: all credentials exhausted; ExLAP auth failed");
                             s.phase = Phase::Failed;
                             push_connection_state(s);
                         }
@@ -735,13 +886,13 @@ fn advance_statement(xml: &str) {
             if xml.contains("<UrlList") {
                 with_state(|s| {
                     let urls = parse_url_list(xml);
-                    host::info(&format!(
-                        "exlap-hook: HU exposes {} URLs:",
-                        urls.len()
-                    ));
+                    host::info(&format!("exlap-hook: HU exposes {} URLs:", urls.len()));
                     for entry in &urls {
                         let url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("?");
-                        let typ = entry.get("url_type").and_then(|v| v.as_str()).unwrap_or("?");
+                        let typ = entry
+                            .get("url_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
                         host::info(&format!("exlap-hook:   {} ({})", url, typ));
                     }
 
@@ -790,7 +941,7 @@ fn advance_statement(xml: &str) {
                         host::info(&format!("exlap-hook: subscribing to {}", url));
                         let body = format!(r#"<Subscribe url="{}" timeStamp="true"/>"#, url);
                         let req = s.make_req(&body);
-                        host::send(&s.make_pkt(&req));
+                        s.send_xml(&req);
                     }
                 });
             }
@@ -872,12 +1023,10 @@ fn process_dat_messages(xml: &str) {
                     "Rel" | "Abs" | "Act" | "Enm" | "Txt" | "Tim" | "Bin" if dat_depth == 1 => {
                         let name = attr_value(e, b"name").unwrap_or_default();
                         let val = attr_value(e, b"val").unwrap_or_default();
-                        let state =
-                            attr_value(e, b"state").unwrap_or_else(|| "ok".to_string());
+                        let state = attr_value(e, b"state").unwrap_or_else(|| "ok".to_string());
 
                         if state != "nodata" && state != "error" {
-                            if let (Some(url), Ok(v)) =
-                                (current_url.as_deref(), val.parse::<f32>())
+                            if let (Some(url), Ok(v)) = (current_url.as_deref(), val.parse::<f32>())
                             {
                                 match url {
                                     "tankLevelSecondary" => {
@@ -975,7 +1124,16 @@ fn compute_auth_response(
     getrandom::getrandom(&mut cnonce_raw).map_err(|e| e.to_string())?;
     let cnonce_b64 = b64.encode(&cnonce_raw);
 
-    let input = format!("{}:{}:{}:{}", user, password, nonce_clean, cnonce_b64);
+    // Match ExlapReader.java computeDigest exactly: each field is truncated to
+    // 44 chars (`%.44s`) before hashing. This also normalises the credential
+    // padding — a 45-char "…==" secret and a 44-char "…=" secret truncate to the
+    // same 44 chars — which is why the reference does it. (Dev commit 56160c5
+    // dropped this based on the VW MediaControl APK; the VAG HU rejects the
+    // resulting digest, so we restore the reference behaviour.)
+    let input = format!(
+        "{:.44}:{:.44}:{:.44}:{:.44}",
+        user, password, nonce_clean, cnonce_b64
+    );
     let hash = sha2::Sha256::digest(input.as_bytes());
     let digest_b64 = b64.encode(hash.as_slice());
 
@@ -985,6 +1143,10 @@ fn compute_auth_response(
 // ── Channel open helpers ──────────────────────────────────────────────────────
 
 /// Build a CHANNEL_OPEN_REQUEST packet for the given channel and service_id.
+/// Currently unused — the phone opens the ExLAP channel itself (see handle_sdr).
+/// Kept for a possible future fallback (would need to be enqueued, not sent
+/// directly, so it flushes toward the HU from a dir=MD invocation).
+#[allow(dead_code)]
 fn build_chan_open_request(channel: u8, service_id: i32) -> Packet {
     // Protobuf ChannelOpenRequest { priority: sint32 = 0, service_id: int32 = X }
     // Field 1 (priority, sint32 zigzag): tag=0x08, zigzag(0)=0x00
@@ -992,8 +1154,9 @@ fn build_chan_open_request(channel: u8, service_id: i32) -> Packet {
     let mut payload = vec![
         (MSG_CHANNEL_OPEN_REQUEST >> 8) as u8,
         (MSG_CHANNEL_OPEN_REQUEST & 0xFF) as u8,
-        0x08, 0x00, // priority = 0
-        0x10,       // field 2 tag
+        0x08,
+        0x00, // priority = 0
+        0x10, // field 2 tag
     ];
     encode_varint(service_id as u64, &mut payload);
 
@@ -1090,7 +1253,11 @@ fn parse_service_for_exlap(data: &[u8]) -> Option<i32> {
         }
     }
 
-    if is_exlap { id } else { None }
+    if is_exlap {
+        id
+    } else {
+        None
+    }
 }
 
 /// Return true if this VendorExtensionService protobuf has
@@ -1161,6 +1328,7 @@ fn read_varint(data: &[u8], pos: usize) -> Option<(u64, usize)> {
 }
 
 /// Append `v` as a protobuf varint to `buf`.
+#[allow(dead_code)]
 fn encode_varint(mut v: u64, buf: &mut Vec<u8>) {
     loop {
         let byte = (v & 0x7F) as u8;
@@ -1193,6 +1361,28 @@ fn xml_root_tag(xml: &str) -> Option<String> {
             _ => {}
         }
     }
+}
+
+/// True if the `<Rsp>` element has a non-empty body (at least one nested tag).
+/// Mirrors ExlapReader.java's `root.getChildNodes().getLength() == 0` auth test:
+/// an empty Rsp (self-closing `<Rsp/>` or `<Rsp></Rsp>`) means success.
+fn rsp_has_children(xml: &str) -> bool {
+    let Some(start) = xml.find("<Rsp") else {
+        return false;
+    };
+    let Some(gt) = xml[start..].find('>') else {
+        return false;
+    };
+    let open_end = start + gt;
+    // Self-closing `<Rsp .../>` → no children.
+    if xml.as_bytes().get(open_end.saturating_sub(1)) == Some(&b'/') {
+        return false;
+    }
+    let body_start = open_end + 1;
+    let Some(close_rel) = xml[body_start..].find("</Rsp>") else {
+        return false;
+    };
+    xml[body_start..body_start + close_rel].contains('<')
 }
 
 fn xml_attr_in_tag(xml: &str, tag_name: &str, attr_name: &str) -> Option<String> {
