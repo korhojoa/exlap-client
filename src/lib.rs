@@ -237,7 +237,8 @@ impl Guest for ExlapHook {
                     name: "exlap_subscribe_urls".to_string(),
                     typ: "string".to_string(),
                     description: format!(
-                        "Comma-separated ExLAP URLs to subscribe to. \
+                        "Comma-separated ExLAP URLs to subscribe to, or \"*\" to subscribe \
+                         to every URL the HU exposes. \
                          tankLevelSecondary and outsideTemperature also feed POST /battery. \
                          Default: {DEFAULT_SUBSCRIBE_URLS}"
                     ),
@@ -755,24 +756,41 @@ fn advance_statement(xml: &str) {
                     s.phase = Phase::Active;
                     s.subscription_limit_reached = false;
 
-                    // Auto-subscribe to configured URLs.
+                    // Resolve the list of URLs to subscribe to. A single "*" entry
+                    // subscribes to every URL the HU exposes; otherwise we keep the
+                    // configured URLs the HU actually offers (logging the ones it
+                    // doesn't, so a typo / unsupported URL is visible).
                     let sub_urls = s.subscribe_urls.clone();
-                    for url in &sub_urls {
-                        let available = urls.iter().any(|e| {
-                            e.get("url").and_then(|v| v.as_str()) == Some(url.as_str())
-                        });
-                        if available {
-                            host::info(&format!("exlap-hook: subscribing to {}", url));
-                            let body =
-                                format!(r#"<Subscribe url="{}" timeStamp="true"/>"#, url);
-                            let req = s.make_req(&body);
-                            host::send(&s.make_pkt(&req));
-                        } else {
-                            host::info(&format!(
-                                "exlap-hook: configured URL \"{}\" not in HU list, skipping",
-                                url
-                            ));
+                    let subscribe_all = sub_urls.iter().any(|u| u == "*");
+
+                    let available_urls: Vec<&str> = urls
+                        .iter()
+                        .filter_map(|e| e.get("url").and_then(|v| v.as_str()))
+                        .collect();
+
+                    let to_subscribe: Vec<String> = if subscribe_all {
+                        available_urls.iter().map(|u| u.to_string()).collect()
+                    } else {
+                        let mut wanted = Vec::new();
+                        for url in &sub_urls {
+                            if available_urls.contains(&url.as_str()) {
+                                wanted.push(url.clone());
+                            } else {
+                                host::info(&format!(
+                                    "exlap-hook: configured URL \"{}\" not in HU list, skipping",
+                                    url
+                                ));
+                            }
                         }
+                        wanted
+                    };
+
+                    // Subscribe to each resolved URL.
+                    for url in &to_subscribe {
+                        host::info(&format!("exlap-hook: subscribing to {}", url));
+                        let body = format!(r#"<Subscribe url="{}" timeStamp="true"/>"#, url);
+                        let req = s.make_req(&body);
+                        host::send(&s.make_pkt(&req));
                     }
                 });
             }
