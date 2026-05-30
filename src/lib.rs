@@ -11,7 +11,7 @@
 /// Key fix over the native implementation: the auth challenge correctly
 /// includes `useHash="sha256"` so the HU knows which digest algorithm to use.
 ///
-/// EV-relevant values (tankLevelSecondary, outsideTemperature) are forwarded
+/// EV-relevant values (tankLevelPrimary/level, outsideTemperature) are forwarded
 /// to the AA energy model via `POST /battery` (on the REST whitelist).
 ///
 /// The URLs to subscribe to are configurable via `exlap_subscribe_urls`.
@@ -29,6 +29,7 @@ use bindings::Guest;
 
 use base64::Engine as _;
 use sha2::Digest as _;
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 // ── Credentials (from ExlapReader.java, in index order) ──────────────────────
@@ -52,7 +53,7 @@ const CREDENTIALS: &[(&str, &str)] = &[
     ),
 ];
 
-const DEFAULT_SUBSCRIBE_URLS: &str = "tankLevelSecondary,outsideTemperature";
+const DEFAULT_SUBSCRIBE_URLS: &str = "tankLevelPrimary,outsideTemperature";
 
 // ── Packet flags and message IDs (mirroring mitm.rs constants) ───────────────
 
@@ -97,14 +98,20 @@ struct ExlapState {
     assemble_buf: Vec<u8>,
     /// Index into CREDENTIALS table being tried.
     cred_idx: usize,
-    /// Last tankLevelSecondary value received.
+    /// Last tankLevelPrimary/level value received.
     tank_level: Option<f32>,
     /// Last outsideTemperature value received.
     outside_temp: Option<f32>,
+    /// Total battery capacity in Wh (from config), sent with every /battery POST.
+    battery_capacity_wh: Option<u64>,
     /// Whether the HU reported subscriptionLimitReached.
     subscription_limit_reached: bool,
     /// URLs to auto-subscribe to after URL list is received (configurable).
     subscribe_urls: Vec<String>,
+    /// Full URL list reported by the HU on connect (url + url_type per entry).
+    known_urls: Vec<serde_json::Value>,
+    /// Last received value per URL (url → {fields, timestamp}).
+    current_values: HashMap<String, serde_json::Value>,
     /// Frames queued for transmission toward the HU. host::send routes to the
     /// *current* proxy task's endpoint, and only the MD task reaches the HU, so
     /// we cannot send directly from the (HU-originated) packets that drive the
@@ -126,8 +133,11 @@ impl ExlapState {
             cred_idx: start_cred.min(CREDENTIALS.len() - 1),
             tank_level: None,
             outside_temp: None,
+            battery_capacity_wh: None,
             subscription_limit_reached: false,
             subscribe_urls,
+            known_urls: Vec::new(),
+            current_values: HashMap::new(),
             outbound: Vec::new(),
             recently_sent: Vec::new(),
         }
@@ -220,18 +230,17 @@ impl Guest for ExlapHook {
                 .unwrap_or_else(|| DEFAULT_SUBSCRIBE_URLS.to_string()),
         );
 
+        let battery_capacity_wh: Option<u64> = host::get_config("exlap_battery_capacity_wh")
+            .and_then(|s| s.parse().ok());
+
         host::info(&format!(
-            "exlap-hook: created channel={:#04x} cred={} subscribe_urls={:?}",
-            channel, start_cred, subscribe_urls
+            "exlap-hook: created channel={:#04x} cred={} subscribe_urls={:?} battery_capacity_wh={:?}",
+            channel, start_cred, subscribe_urls, battery_capacity_wh
         ));
 
-        STATE
-            .set(Mutex::new(ExlapState::new(
-                channel,
-                start_cred,
-                subscribe_urls,
-            )))
-            .ok();
+        let mut state = ExlapState::new(channel, start_cred, subscribe_urls);
+        state.battery_capacity_wh = battery_capacity_wh;
+        STATE.set(Mutex::new(state)).ok();
     }
 
     fn on_destroy() {
@@ -283,10 +292,21 @@ impl Guest for ExlapHook {
                     description: format!(
                         "Comma-separated ExLAP URLs to subscribe to, or \"*\" to subscribe \
                          to every URL the HU exposes. \
-                         tankLevelSecondary and outsideTemperature also feed POST /battery. \
+                         tankLevelPrimary/level and outsideTemperature also feed POST /battery. \
                          Default: {DEFAULT_SUBSCRIBE_URLS}"
                     ),
                     default_value: DEFAULT_SUBSCRIBE_URLS.to_string(),
+                    values: None,
+                },
+                CustomConfigEntry {
+                    name: "exlap_battery_capacity_wh".to_string(),
+                    typ: "u64".to_string(),
+                    description: "Total battery/tank capacity in Wh. \
+                        Sent as battery_capacity_wh with every POST /battery so aa-proxy-rs \
+                        can compute the correct energy level from the percentage. \
+                        Example: 58000 for a 58 kWh battery. Leave 0 to use the model default."
+                        .to_string(),
+                    default_value: "0".to_string(),
                     values: None,
                 },
             ],
@@ -312,6 +332,11 @@ impl Guest for ExlapHook {
                 let urls = parse_subscribe_urls(&value);
                 host::info(&format!("exlap-hook: exlap_subscribe_urls → {:?}", urls));
                 s.subscribe_urls = urls;
+            }
+            "exlap_battery_capacity_wh" => {
+                let cap = value.parse::<u64>().ok().filter(|&v| v > 0);
+                s.battery_capacity_wh = cap;
+                host::info(&format!("exlap-hook: exlap_battery_capacity_wh → {:?}", cap));
             }
             _ => {}
         });
@@ -398,11 +423,34 @@ impl Guest for ExlapHook {
                     "ok".to_string()
                 })
             }
+            "get" => {
+                let url = match val.get("url").and_then(|v| v.as_str()) {
+                    Some(u) => u.to_string(),
+                    None => return "error: missing url".to_string(),
+                };
+                with_state(|s| {
+                    if s.phase != Phase::Active {
+                        return format!("error: not active (phase={:?})", s.phase);
+                    }
+                    let body = format!(r#"<Get url="{}" timeStamp="true"/>"#, url);
+                    let xml = s.make_req(&body);
+                    s.send_xml(&xml);
+                    host::info(&format!("exlap-hook: ws get → {}", url));
+                    "ok".to_string()
+                })
+            }
             "list" => with_state(|s| {
                 let snapshot = serde_json::json!({
                     "connection_state": phase_str(&s.phase),
                     "subscription_limit_reached": s.subscription_limit_reached,
-                    "urls": [],
+                    "urls": s.known_urls,
+                });
+                host::send_ws_event("exlap", &snapshot.to_string());
+                "ok".to_string()
+            }),
+            "values" => with_state(|s| {
+                let snapshot = serde_json::json!({
+                    "current_values": s.current_values,
                 });
                 host::send_ws_event("exlap", &snapshot.to_string());
                 "ok".to_string()
@@ -896,6 +944,8 @@ fn advance_statement(xml: &str) {
                         host::info(&format!("exlap-hook:   {} ({})", url, typ));
                     }
 
+                    s.known_urls = urls.clone();
+
                     let snapshot = serde_json::json!({
                         "connection_state": "active",
                         "subscription_limit_reached": false,
@@ -1007,9 +1057,42 @@ fn process_dat_messages(xml: &str) {
     let mut changes: Vec<serde_json::Value> = Vec::new();
     let mut ev_updated = false;
 
+    // Parse name/val/state from a field element and push to current_fields,
+    // also updating the EV-relevant state values.
+    macro_rules! push_field {
+        ($e:expr, $tag:expr) => {{
+            let name = attr_value($e, b"name").unwrap_or_default();
+            let val = attr_value($e, b"val").unwrap_or_default();
+            let state = attr_value($e, b"state").unwrap_or_else(|| "ok".to_string());
+            if state != "nodata" && state != "error" {
+                if let (Some(url), Ok(v)) = (current_url.as_deref(), val.parse::<f32>()) {
+                    match url {
+                        "tankLevelPrimary" if name == "level" => {
+                            let pct = v * 100.0;
+                            host::info(&format!("exlap-hook: tankLevelPrimary/level={}%", pct));
+                            with_state(|s| s.tank_level = Some(pct));
+                            ev_updated = true;
+                        }
+                        "outsideTemperature" => {
+                            host::info(&format!("exlap-hook: outsideTemperature={}°C", v));
+                            with_state(|s| s.outside_temp = Some(v));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            current_fields.push(serde_json::json!({
+                "name": name,
+                "type": $tag,
+                "val": val,
+                "state": state,
+            }));
+        }};
+    }
+
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+            Ok(Event::Start(ref e)) => {
                 let tag = std::str::from_utf8(e.name().local_name().as_ref())
                     .unwrap_or("")
                     .to_string();
@@ -1021,45 +1104,42 @@ fn process_dat_messages(xml: &str) {
                         dat_depth = 1;
                     }
                     "Rel" | "Abs" | "Act" | "Enm" | "Txt" | "Tim" | "Bin" if dat_depth == 1 => {
-                        let name = attr_value(e, b"name").unwrap_or_default();
-                        let val = attr_value(e, b"val").unwrap_or_default();
-                        let state = attr_value(e, b"state").unwrap_or_else(|| "ok".to_string());
-
-                        if state != "nodata" && state != "error" {
-                            if let (Some(url), Ok(v)) = (current_url.as_deref(), val.parse::<f32>())
-                            {
-                                match url {
-                                    "tankLevelSecondary" => {
-                                        host::info(&format!(
-                                            "exlap-hook: tankLevelSecondary={}%",
-                                            v
-                                        ));
-                                        with_state(|s| s.tank_level = Some(v));
-                                        ev_updated = true;
-                                    }
-                                    "outsideTemperature" => {
-                                        host::info(&format!(
-                                            "exlap-hook: outsideTemperature={}°C",
-                                            v
-                                        ));
-                                        with_state(|s| s.outside_temp = Some(v));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        current_fields.push(serde_json::json!({
-                            "name": name,
-                            "type": tag,
-                            "val": val,
-                            "state": state,
-                        }));
-                        dat_depth += 1;
+                        push_field!(e, tag);
+                        dat_depth += 1; // balanced by the matching Event::End
                     }
                     _ if dat_depth > 0 => {
                         dat_depth += 1;
                     }
                     _ => {}
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                // Self-closing elements produce no Event::End, so dat_depth must
+                // not change when we parse field elements — otherwise subsequent
+                // fields in the same <Dat> fall out of the dat_depth == 1 guard
+                // and are silently dropped.
+                let tag = std::str::from_utf8(e.name().local_name().as_ref())
+                    .unwrap_or("")
+                    .to_string();
+                match tag.as_str() {
+                    "Dat" if dat_depth == 0 => {
+                        // Self-closing <Dat/> — commit immediately with no fields.
+                        current_url = attr_value(e, b"url");
+                        current_timestamp = attr_value(e, b"timeStamp");
+                        current_fields.clear();
+                        if let Some(url) = current_url.take() {
+                            changes.push(serde_json::json!({
+                                "url": url,
+                                "fields": [],
+                                "timestamp": current_timestamp,
+                            }));
+                        }
+                    }
+                    "Rel" | "Abs" | "Act" | "Enm" | "Txt" | "Tim" | "Bin" if dat_depth == 1 => {
+                        push_field!(e, tag);
+                        // dat_depth stays at 1: no End event is coming.
+                    }
+                    _ => {} // ignore at other depths
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -1085,10 +1165,12 @@ fn process_dat_messages(xml: &str) {
     }
 
     if ev_updated {
-        let (tank, temp) = with_state(|s| (s.tank_level, s.outside_temp));
+        let (tank, temp, cap) =
+            with_state(|s| (s.tank_level, s.outside_temp, s.battery_capacity_wh));
         let body = serde_json::json!({
             "battery_level_percentage": tank,
             "external_temp_celsius": temp,
+            "battery_capacity_wh": cap,
         });
         // Use rest_call_async so the HTTP POST to /battery doesn't block modify_packet.
         // ureq has no default timeout; a slow local server would otherwise exceed the
@@ -1098,6 +1180,13 @@ fn process_dat_messages(xml: &str) {
     }
 
     if !changes.is_empty() {
+        with_state(|s| {
+            for change in &changes {
+                if let Some(url) = change.get("url").and_then(|v| v.as_str()) {
+                    s.current_values.insert(url.to_string(), change.clone());
+                }
+            }
+        });
         let payload = serde_json::to_string(&changes).unwrap_or_default();
         host::send_ws_event("exlap", &payload);
     }
