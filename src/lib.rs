@@ -36,7 +36,7 @@ use std::sync::{Mutex, OnceLock};
 const CREDENTIALS: &[(&str, &str)] = &[
     ("Test_TB-105000", "s4T2K6BAv0a7LQvrv3vdaUl17xEl2WJOpTmAThpRZe0=="),
     ("RSE_L-CA2000", "T53Facvq51jO8vQJrBNx3MqLWmPcHf/hkow7yLu7SuA=="),
-    ("RSE_3-DE1400", "KozPo8iE0j72pkbWXKcP0QihpxgML3Opp8fNJZ0wN24=="),
+    ("RSE_3-DE1400", "KozPo8iE0j72pkbWXKcP0QihpxgML3Opp8fNJZ0wN24="),
     ("ML_74-125000", "Fo7arEpPhAgMMznzxRlV8B7eeZgNDIYQcy0Gr7Ad1Fg=="),
 ];
 
@@ -517,18 +517,82 @@ fn handle_xml(xml: &str) {
             }
             advance_statement(xml);
         }
+        // Bare <Status> elements (Init/Alive/Bye/Dataloss) sent outside ExlapStatement.
+        "Status" => {
+            handle_status_element(xml);
+        }
         other => {
             host::info(&format!("exlap-hook: unknown root element <{}>", other));
         }
     }
 }
 
+/// Dispatch a bare `<Status>...</Status>` element (not wrapped in ExlapStatement).
+fn handle_status_element(xml: &str) {
+    if xml.contains("Alive") {
+        with_state(|s| {
+            let req = s.make_req("<Alive/>");
+            host::send(&s.make_pkt(&req));
+            host::info("exlap-hook: Alive ping → sent <Alive/>");
+        });
+    } else if xml.contains("Bye") {
+        host::info("exlap-hook: HU sent Bye via Status element; resetting");
+        with_state(|s| {
+            let cred_idx = s.cred_idx;
+            let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
+            let channel = s.exlap_channel;
+            *s = ExlapState::new(channel, cred_idx, subscribe_urls);
+            push_connection_state(s);
+        });
+    } else if xml.contains("Init") {
+        // Bare <Status>Init</Status> — treat same as wrapped Init.
+        host::info("exlap-hook: got bare <Status>Init</Status>; sending Protocol request");
+        with_state(|s| {
+            let req = s.make_req(r#"<Protocol version="1" returnCapabilities="true"/>"#);
+            let pkt = s.make_pkt(&req);
+            s.phase = Phase::WaitCapabilities;
+            push_connection_state(s);
+            host::send(&pkt);
+        });
+    } else if xml.contains("Dataloss") {
+        host::info("exlap-hook: HU reported Dataloss on ExLAP channel");
+    } else {
+        host::info(&format!("exlap-hook: unhandled Status element: {}", xml));
+    }
+}
+
 fn advance_statement(xml: &str) {
+    // Handle keepalive pings and Bye in any phase — these can arrive at any time.
+    // Format inside ExlapStatement: <Status>Alive</Status> or <Alive/>.
+    if xml.contains(">Alive<") || xml.contains("<Alive") {
+        with_state(|s| {
+            let req = s.make_req("<Alive/>");
+            host::send(&s.make_pkt(&req));
+        });
+        // Don't return — the packet may also contain other elements.
+        return;
+    }
+    if xml.contains(">Bye<") || xml.contains("<Bye") {
+        host::info("exlap-hook: HU sent Bye; resetting ExLAP connection");
+        with_state(|s| {
+            let cred_idx = s.cred_idx;
+            let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
+            let channel = s.exlap_channel;
+            *s = ExlapState::new(channel, cred_idx, subscribe_urls);
+            push_connection_state(s);
+        });
+        return;
+    }
+    if xml.contains(">Dataloss<") {
+        host::info("exlap-hook: HU reported Dataloss");
+        return;
+    }
+
     let phase = with_state(|s| s.phase.clone());
 
     match phase {
         Phase::WaitInit => {
-            if xml.contains("<Init") {
+            if xml.contains("<Init") || xml.contains(">Init<") {
                 host::info("exlap-hook: got <Init>; sending Protocol request");
                 with_state(|s| {
                     let req = s.make_req(r#"<Protocol version="1" returnCapabilities="true"/>"#);
@@ -540,14 +604,25 @@ fn advance_statement(xml: &str) {
             }
         }
         Phase::WaitCapabilities => {
-            if xml.contains("<Capabilities") {
+            // Advance if we got Capabilities, or if we got any Rsp (some HUs
+            // respond to Protocol with a plain <Rsp status="ok"/> and no body).
+            if xml.contains("<Capabilities") || xml.contains("<Rsp") {
                 with_state(|s| {
-                    host::info(&format!(
-                        "exlap-hook: got <Capabilities>; sending auth challenge \
-                         cred={} user=\"{}\"",
-                        s.cred_idx,
-                        s.user()
-                    ));
+                    if xml.contains("<Capabilities") {
+                        host::info(&format!(
+                            "exlap-hook: got <Capabilities>; sending auth challenge \
+                             cred={} user=\"{}\"",
+                            s.cred_idx,
+                            s.user()
+                        ));
+                    } else {
+                        host::info(&format!(
+                            "exlap-hook: Protocol Rsp (no Capabilities); sending auth challenge \
+                             cred={} user=\"{}\"",
+                            s.cred_idx,
+                            s.user()
+                        ));
+                    }
                     let req = s.make_req(r#"<Authenticate phase="challenge" useHash="sha256"/>"#);
                     let pkt = s.make_pkt(&req);
                     s.phase = Phase::WaitAuthChallenge;
@@ -588,29 +663,28 @@ fn advance_statement(xml: &str) {
         }
         Phase::WaitAuthResponse => {
             if xml.contains("<Rsp") {
-                let inner = extract_rsp_inner(xml);
-                let empty = inner.map(|s| !s.trim().contains('<')).unwrap_or(true);
-                if empty {
+                let status = xml_attr_in_tag(xml, "Rsp", "status").unwrap_or_default();
+                if status == "ok" {
                     with_state(|s| {
                         host::info(&format!(
                             "exlap-hook: authenticated with cred={} user=\"{}\"",
                             s.cred_idx,
                             s.user()
                         ));
-                        let req = s.make_req("<Dir/>");
+                        let body = r#"<Dir urlPattern="*" fromEntry="1" numOfEntries="999999999"/>"#;
+                        let req = s.make_req(body);
                         let pkt = s.make_pkt(&req);
                         s.phase = Phase::WaitUrlList;
                         push_connection_state(s);
                         host::send(&pkt);
                     });
                 } else {
-                    let rsp_content = inner.unwrap_or("").trim().to_string();
                     with_state(|s| {
                         host::info(&format!(
-                            "exlap-hook: auth failed cred={} user=\"{}\" rsp={:?}",
+                            "exlap-hook: auth failed cred={} user=\"{}\" status={:?}",
                             s.cred_idx,
                             s.user(),
-                            rsp_content
+                            status
                         ));
                         let next = s.cred_idx + 1;
                         if next < CREDENTIALS.len() {
@@ -754,7 +828,7 @@ fn process_dat_messages(xml: &str) {
                 match tag.as_str() {
                     "Dat" if dat_depth == 0 => {
                         current_url = attr_value(e, b"url");
-                        current_timestamp = attr_value(e, b"timestamp");
+                        current_timestamp = attr_value(e, b"timeStamp");
                         current_val.clear();
                         current_val_type.clear();
                         current_state = "ok".to_string();
@@ -845,8 +919,9 @@ fn process_dat_messages(xml: &str) {
 
 /// Compute the ExLAP SHA-256 auth digest.
 ///
-/// Matches ExlapReader.java `computeDigest`:
-///   sha256("{user:.44}:{password:.44}:{b64(nonce_bytes):.44}:{b64(cnonce_bytes):.44}") → base64
+/// Matches SHA256Digest.calculate() from the VW MediaControl APK:
+///   sha256("{user}:{password}:{b64(nonce_bytes)}:{b64(cnonce_bytes)}") → base64
+/// No field truncation — the Java implementation concatenates the full strings.
 fn compute_auth_response(
     nonce_b64: &str,
     user: &str,
@@ -861,10 +936,7 @@ fn compute_auth_response(
     getrandom::getrandom(&mut cnonce_raw).map_err(|e| e.to_string())?;
     let cnonce_b64 = b64.encode(&cnonce_raw);
 
-    let input = format!(
-        "{:.44}:{:.44}:{:.44}:{:.44}",
-        user, password, nonce_clean, cnonce_b64
-    );
+    let input = format!("{}:{}:{}:{}", user, password, nonce_clean, cnonce_b64);
     let hash = sha2::Sha256::digest(input.as_bytes());
     let digest_b64 = b64.encode(hash.as_slice());
 
@@ -1133,16 +1205,4 @@ fn attr_value(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> 
         .find(|a| a.key.local_name().as_ref() == name)
         .and_then(|a| a.unescape_value().ok())
         .map(|v| v.into_owned())
-}
-
-fn extract_rsp_inner(xml: &str) -> Option<&str> {
-    let start = xml.find("<Rsp")?;
-    let after_bracket = xml[start..].find('>')?;
-    let open_end = start + after_bracket;
-    if xml.as_bytes().get(open_end.saturating_sub(1)) == Some(&b'/') {
-        return None; // self-closing
-    }
-    let content_start = open_end + 1;
-    let close = xml.find("</Rsp>")?;
-    Some(&xml[content_start..close])
 }
