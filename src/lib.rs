@@ -64,6 +64,11 @@ const CREDENTIALS: &[(&str, &str)] = &[
 
 const DEFAULT_SUBSCRIBE_URLS: &str = "tankLevelPrimary,outsideTemperature";
 
+/// Server-heartbeat interval (seconds) requested on connect. ExLAP v1.3 allows
+/// 0–60; 0 disables the heartbeat and lets the HU leak sessions across reconnects
+/// (see the <Heartbeat> send site). Keep nonzero so dead sessions get reaped.
+const HEARTBEAT_IVAL_SECS: u8 = 10;
+
 // ── Packet flags and message IDs (mirroring mitm.rs constants) ───────────────
 
 const ENCRYPTED: u8 = 1 << 3;
@@ -976,12 +981,19 @@ fn advance_statement(xml: &str) {
                             s.cred_idx,
                             s.user()
                         ));
-                        // Spec §3.5.9: disable server heartbeat so the HU doesn't send
-                        // periodic <Status><Alive/> messages we have to track.
-                        // If the HU doesn't support <Heartbeat/> it returns notImplemented
-                        // (handled gracefully in Active phase) and we fall back to responding
-                        // to any Alive pings that arrive.
-                        let hb_req = s.make_req("<Heartbeat ival=\"0\"/>");
+                        // Enable the server heartbeat (ExLAP v1.3: ival is 0–60 s; 0
+                        // DISABLES it). We deliberately do NOT disable it: with the
+                        // heartbeat on, the HU detects when our client goes away (e.g. the
+                        // AA/USB link drops) and reaps the session. With ival=0 it never
+                        // does, so every reconnect leaks a session_id and the HU eventually
+                        // runs out of ExLAP slots and stops accepting new connections —
+                        // i.e. ExLAP dies after a handful of reconnections. The hook already
+                        // answers Alive pings (see handle_status_element / advance_statement),
+                        // so a live session keeps responding and only a genuinely dead one is
+                        // reaped. If the HU doesn't support <Heartbeat/> it returns
+                        // notImplemented (handled gracefully in Active phase).
+                        let hb_req =
+                            s.make_req(&format!("<Heartbeat ival=\"{}\"/>", HEARTBEAT_IVAL_SECS));
                         s.send_xml(&hb_req);
 
                         let body =
