@@ -389,6 +389,29 @@ impl Guest for ExlapHook {
             return Decision::Forward; // Other hooks/handlers still need the SDR.
         }
 
+        // Self-heal the ExLAP channel. The channel is normally learned from the
+        // SDR, but a mid-session hot-reload (or a missed SDR) leaves the hook on
+        // the config default and deaf to the real ExLAP channel. ExLAP frames are
+        // plain "<Exlap…" XML, so if we see one on a channel we aren't tracking
+        // and we're not yet connected, adopt that channel. Cheap prefix check on
+        // data frames only; gated to WaitChanOpen so we never hijack a live
+        // session. This lets the very same beacon both teach the channel and
+        // drive the connect below.
+        if pkt.channel != 0
+            && (pkt.packet_flags & CONTROL_FLAG) == 0
+            && pkt.payload.starts_with(b"<Exlap")
+        {
+            with_state(|s| {
+                if s.phase == Phase::WaitChanOpen && s.exlap_channel != pkt.channel {
+                    host::info(&format!(
+                        "exlap-hook: adopting ExLAP channel {:#04x} from observed ExLAP frame",
+                        pkt.channel
+                    ));
+                    s.exlap_channel = pkt.channel;
+                }
+            });
+        }
+
         let channel = with_state(|s| s.exlap_channel);
         if pkt.channel != channel {
             return Decision::Forward;
@@ -649,17 +672,24 @@ fn handle_control(pkt: &Packet) {
 
         debug_log(&format!(
             "exlap-hook: channel {:#04x} open (status={}); \
-             sending ExlapConnectionRequest session_id={} cred={} (\"{}\")",
+             sending ExlapConnectionRequest cred={} (\"{}\")",
             s.exlap_channel,
             status,
-            s.session_id,
             s.cred_idx,
             s.user()
         ));
-        s.phase = Phase::WaitConnReturn;
-        let xml = format!(r#"<ExlapConnectionRequest session_id="{}"/>"#, s.session_id);
-        s.send_xml(&xml);
+        send_exlap_connection_request(s);
     });
+}
+
+/// Send a fresh `<ExlapConnectionRequest>` and enter WaitConnReturn. Regenerates
+/// the session_id so every connect attempt (initial or beacon-driven retry) is
+/// distinct and not confused with a stale prior attempt's responses.
+fn send_exlap_connection_request(s: &mut ExlapState) {
+    s.session_id = make_session_id();
+    s.phase = Phase::WaitConnReturn;
+    let xml = format!(r#"<ExlapConnectionRequest session_id="{}"/>"#, s.session_id);
+    s.send_xml(&xml);
 }
 
 /// Intercept the HU's ServiceDiscoveryResponse, find the ExLAP vendor service,
@@ -706,7 +736,28 @@ fn handle_xml(xml: &str) {
     let root = xml_root_tag(xml).unwrap_or_default();
 
     match root.as_str() {
-        "ExlapBeacon" => {}
+        "ExlapBeacon" => {
+            // The HU emits ExlapBeacon (~every 5s) to advertise that its ExLAP
+            // server is up and accepting connections. Use it as the (re)connect
+            // trigger/retry: if we are not yet connected, send a fresh
+            // ExlapConnectionRequest. This is the recovery path for two cases the
+            // CHANNEL_OPEN_RESPONSE trigger alone cannot handle:
+            //   1. First connect lost the race — we fired the request before the
+            //      HU's ExLAP/SAI server was ready and got connected="false".
+            //   2. Reconnect within the same AA session — the channel is already
+            //      open, so no new CHANNEL_OPEN_RESPONSE arrives to drive us.
+            // Receiving a beacon proves the channel is open and the server is
+            // ready, so this is always a safe moment to (re)issue the request.
+            // Mirrors ExlapReader.java's connect-retry loop. We only retry from
+            // WaitChanOpen (idle / post-reset) so we never race an in-flight
+            // handshake (WaitConnReturn) or a live session.
+            with_state(|s| {
+                if s.phase == Phase::WaitChanOpen {
+                    debug_log("exlap-hook: ExlapBeacon — (re)sending ExlapConnectionRequest");
+                    send_exlap_connection_request(s);
+                }
+            });
+        }
         "ExlapConnectionClosed" => {
             debug_log("exlap-hook: HU closed ExLAP connection");
             with_state(|s| {
@@ -731,8 +782,19 @@ fn handle_xml(xml: &str) {
                     .map(|v| v == "true")
                     .unwrap_or(false);
                 if !connected {
-                    host::error("exlap-hook: ExlapConnectionReturn connected=false");
-                    s.phase = Phase::Failed;
+                    // The HU rejects the connection when its ExLAP/SAI server
+                    // isn't ready yet (lost the startup race). Don't fail
+                    // permanently: reset to WaitChanOpen with a fresh session_id
+                    // and let the next ExlapBeacon retry the connect. The server
+                    // beacons (~every 5s) once it is ready.
+                    host::error(
+                        "exlap-hook: ExlapConnectionReturn connected=false; \
+                         retrying on next ExlapBeacon",
+                    );
+                    let cred_idx = s.cred_idx;
+                    let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
+                    let channel = s.exlap_channel;
+                    *s = ExlapState::new(channel, cred_idx, subscribe_urls);
                     push_connection_state(s);
                     return;
                 }
