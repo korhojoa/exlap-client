@@ -30,13 +30,10 @@ Output: `target/wasm32-wasip1/release/exlap_hook.wasm`
 Copy the `.wasm` to the aa-proxy-rs device:
 
 ```sh
-scp target/wasm32-wasip1/release/exlap_hook.wasm root@10.0.0.1:/data/wasm-hooks/exlap_hook/exlap_hook.wasm
+scp -O target/wasm32-wasip1/release/exlap_hook.wasm root@<aa-proxy-rs-address>:/data/wasm-hooks/exlap_hook.wasm
 ```
 
-Enable in aa-proxy-rs config (`/etc/aa-proxy-rs/config.toml`):
-```toml
-exlap = true
-```
+Enable in aa-proxy-rs config webui.
 
 ## WIT interface
 
