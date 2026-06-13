@@ -64,6 +64,11 @@ const CREDENTIALS: &[(&str, &str)] = &[
 
 const DEFAULT_SUBSCRIBE_URLS: &str = "tankLevelPrimary,outsideTemperature";
 
+/// Server-heartbeat interval (seconds) requested on connect. ExLAP v1.3 allows
+/// 0–60; 0 disables the heartbeat and lets the HU leak sessions across reconnects
+/// (see the <Heartbeat> send site). Keep nonzero so dead sessions get reaped.
+const HEARTBEAT_IVAL_SECS: u8 = 10;
+
 // ── Packet flags and message IDs (mirroring mitm.rs constants) ───────────────
 
 const ENCRYPTED: u8 = 1 << 3;
@@ -389,6 +394,29 @@ impl Guest for ExlapHook {
             return Decision::Forward; // Other hooks/handlers still need the SDR.
         }
 
+        // Self-heal the ExLAP channel. The channel is normally learned from the
+        // SDR, but a mid-session hot-reload (or a missed SDR) leaves the hook on
+        // the config default and deaf to the real ExLAP channel. ExLAP frames are
+        // plain "<Exlap…" XML, so if we see one on a channel we aren't tracking
+        // and we're not yet connected, adopt that channel. Cheap prefix check on
+        // data frames only; gated to WaitChanOpen so we never hijack a live
+        // session. This lets the very same beacon both teach the channel and
+        // drive the connect below.
+        if pkt.channel != 0
+            && (pkt.packet_flags & CONTROL_FLAG) == 0
+            && pkt.payload.starts_with(b"<Exlap")
+        {
+            with_state(|s| {
+                if s.phase == Phase::WaitChanOpen && s.exlap_channel != pkt.channel {
+                    host::info(&format!(
+                        "exlap-hook: adopting ExLAP channel {:#04x} from observed ExLAP frame",
+                        pkt.channel
+                    ));
+                    s.exlap_channel = pkt.channel;
+                }
+            });
+        }
+
         let channel = with_state(|s| s.exlap_channel);
         if pkt.channel != channel {
             return Decision::Forward;
@@ -649,17 +677,24 @@ fn handle_control(pkt: &Packet) {
 
         debug_log(&format!(
             "exlap-hook: channel {:#04x} open (status={}); \
-             sending ExlapConnectionRequest session_id={} cred={} (\"{}\")",
+             sending ExlapConnectionRequest cred={} (\"{}\")",
             s.exlap_channel,
             status,
-            s.session_id,
             s.cred_idx,
             s.user()
         ));
-        s.phase = Phase::WaitConnReturn;
-        let xml = format!(r#"<ExlapConnectionRequest session_id="{}"/>"#, s.session_id);
-        s.send_xml(&xml);
+        send_exlap_connection_request(s);
     });
+}
+
+/// Send a fresh `<ExlapConnectionRequest>` and enter WaitConnReturn. Regenerates
+/// the session_id so every connect attempt (initial or beacon-driven retry) is
+/// distinct and not confused with a stale prior attempt's responses.
+fn send_exlap_connection_request(s: &mut ExlapState) {
+    s.session_id = make_session_id();
+    s.phase = Phase::WaitConnReturn;
+    let xml = format!(r#"<ExlapConnectionRequest session_id="{}"/>"#, s.session_id);
+    s.send_xml(&xml);
 }
 
 /// Intercept the HU's ServiceDiscoveryResponse, find the ExLAP vendor service,
@@ -706,7 +741,28 @@ fn handle_xml(xml: &str) {
     let root = xml_root_tag(xml).unwrap_or_default();
 
     match root.as_str() {
-        "ExlapBeacon" => {}
+        "ExlapBeacon" => {
+            // The HU emits ExlapBeacon (~every 5s) to advertise that its ExLAP
+            // server is up and accepting connections. Use it as the (re)connect
+            // trigger/retry: if we are not yet connected, send a fresh
+            // ExlapConnectionRequest. This is the recovery path for two cases the
+            // CHANNEL_OPEN_RESPONSE trigger alone cannot handle:
+            //   1. First connect lost the race — we fired the request before the
+            //      HU's ExLAP/SAI server was ready and got connected="false".
+            //   2. Reconnect within the same AA session — the channel is already
+            //      open, so no new CHANNEL_OPEN_RESPONSE arrives to drive us.
+            // Receiving a beacon proves the channel is open and the server is
+            // ready, so this is always a safe moment to (re)issue the request.
+            // Mirrors ExlapReader.java's connect-retry loop. We only retry from
+            // WaitChanOpen (idle / post-reset) so we never race an in-flight
+            // handshake (WaitConnReturn) or a live session.
+            with_state(|s| {
+                if s.phase == Phase::WaitChanOpen {
+                    debug_log("exlap-hook: ExlapBeacon — (re)sending ExlapConnectionRequest");
+                    send_exlap_connection_request(s);
+                }
+            });
+        }
         "ExlapConnectionClosed" => {
             debug_log("exlap-hook: HU closed ExLAP connection");
             with_state(|s| {
@@ -731,8 +787,19 @@ fn handle_xml(xml: &str) {
                     .map(|v| v == "true")
                     .unwrap_or(false);
                 if !connected {
-                    host::error("exlap-hook: ExlapConnectionReturn connected=false");
-                    s.phase = Phase::Failed;
+                    // The HU rejects the connection when its ExLAP/SAI server
+                    // isn't ready yet (lost the startup race). Don't fail
+                    // permanently: reset to WaitChanOpen with a fresh session_id
+                    // and let the next ExlapBeacon retry the connect. The server
+                    // beacons (~every 5s) once it is ready.
+                    host::error(
+                        "exlap-hook: ExlapConnectionReturn connected=false; \
+                         retrying on next ExlapBeacon",
+                    );
+                    let cred_idx = s.cred_idx;
+                    let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
+                    let channel = s.exlap_channel;
+                    *s = ExlapState::new(channel, cred_idx, subscribe_urls);
                     push_connection_state(s);
                     return;
                 }
@@ -745,10 +812,20 @@ fn handle_xml(xml: &str) {
             let sid = xml_attr_in_tag(xml, "ExlapStatement", "session_id").unwrap_or_default();
             let our_sid = with_state(|s| s.session_id.clone());
             if sid != our_sid {
+                // Not our session — don't let it drive our connection/auth state
+                // machine. But <Dat> frames are self-describing (url + fields +
+                // timestamp), so we can still passively HARVEST measurements from
+                // any other session on the channel: an orphaned session, or a
+                // phone-side ExLAP client. This means we keep feeding values (e.g.
+                // tankLevelPrimary → POST /battery) even when our own session is
+                // wedged or we never got a connection slot. We only read Dat here;
+                // control frames (auth/Bye/Alive) for the foreign session are
+                // ignored by process_dat_messages.
                 debug_log(&format!(
-                    "exlap-hook: ignoring ExlapStatement session_id={:?} (ours={:?})",
+                    "exlap-hook: harvesting Dat from foreign session_id={:?} (ours={:?})",
                     sid, our_sid
                 ));
+                process_dat_messages(xml);
                 return;
             }
             advance_statement(xml);
@@ -914,12 +991,19 @@ fn advance_statement(xml: &str) {
                             s.cred_idx,
                             s.user()
                         ));
-                        // Spec §3.5.9: disable server heartbeat so the HU doesn't send
-                        // periodic <Status><Alive/> messages we have to track.
-                        // If the HU doesn't support <Heartbeat/> it returns notImplemented
-                        // (handled gracefully in Active phase) and we fall back to responding
-                        // to any Alive pings that arrive.
-                        let hb_req = s.make_req("<Heartbeat ival=\"0\"/>");
+                        // Enable the server heartbeat (ExLAP v1.3: ival is 0–60 s; 0
+                        // DISABLES it). We deliberately do NOT disable it: with the
+                        // heartbeat on, the HU detects when our client goes away (e.g. the
+                        // AA/USB link drops) and reaps the session. With ival=0 it never
+                        // does, so every reconnect leaks a session_id and the HU eventually
+                        // runs out of ExLAP slots and stops accepting new connections —
+                        // i.e. ExLAP dies after a handful of reconnections. The hook already
+                        // answers Alive pings (see handle_status_element / advance_statement),
+                        // so a live session keeps responding and only a genuinely dead one is
+                        // reaped. If the HU doesn't support <Heartbeat/> it returns
+                        // notImplemented (handled gracefully in Active phase).
+                        let hb_req =
+                            s.make_req(&format!("<Heartbeat ival=\"{}\"/>", HEARTBEAT_IVAL_SECS));
                         s.send_xml(&hb_req);
 
                         let body =
