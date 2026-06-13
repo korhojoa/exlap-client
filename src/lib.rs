@@ -812,10 +812,20 @@ fn handle_xml(xml: &str) {
             let sid = xml_attr_in_tag(xml, "ExlapStatement", "session_id").unwrap_or_default();
             let our_sid = with_state(|s| s.session_id.clone());
             if sid != our_sid {
+                // Not our session — don't let it drive our connection/auth state
+                // machine. But <Dat> frames are self-describing (url + fields +
+                // timestamp), so we can still passively HARVEST measurements from
+                // any other session on the channel: an orphaned session, or a
+                // phone-side ExLAP client. This means we keep feeding values (e.g.
+                // tankLevelPrimary → POST /battery) even when our own session is
+                // wedged or we never got a connection slot. We only read Dat here;
+                // control frames (auth/Bye/Alive) for the foreign session are
+                // ignored by process_dat_messages.
                 debug_log(&format!(
-                    "exlap-hook: ignoring ExlapStatement session_id={:?} (ours={:?})",
+                    "exlap-hook: harvesting Dat from foreign session_id={:?} (ours={:?})",
                     sid, our_sid
                 ));
+                process_dat_messages(xml);
                 return;
             }
             advance_statement(xml);
