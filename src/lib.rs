@@ -1,22 +1,28 @@
-/// ExLAP WASM hook for aa-proxy-rs.
-///
-/// Implements the full ExLAP protocol state machine (matching ExlapReader.java)
-/// as a standalone plugin for stock aa-proxy-rs (no host modifications required).
-///
-/// The hook watches all packets. When it sees the HU's ServiceDiscoveryResponse
-/// (channel 0, msg_id 6) it finds the ExLAP vendor service, sends a
-/// CHANNEL_OPEN_REQUEST on the discovered channel, then takes over all packets
-/// on that channel to run auth + session setup.
-///
-/// Key fix over the native implementation: the auth challenge correctly
-/// includes `useHash="sha256"` so the HU knows which digest algorithm to use.
-///
-/// EV-relevant values (tankLevelPrimary/level, outsideTemperature) are forwarded
-/// to the AA energy model via `POST /battery` (on the REST whitelist).
-///
-/// The URLs to subscribe to are configurable via `exlap_subscribe_urls`.
-/// Subscribe/Unsubscribe can also be triggered at runtime via WS
-/// `script_event` messages routed to `ws_script_handler`.
+//! An ExLAP hook for aa-proxy-rs.
+//!
+//! This plugin runs the ExLAP protocol against a VW, Audi, Skoda or Seat MIB2
+//! head unit. It needs no change to aa-proxy-rs. It works on the Android Auto
+//! vendor channel `com.vwag.infotainment.gal.exlap`.
+//!
+//! # This is a transport, not a protocol
+//!
+//! The session itself is the [`exlap`] crate. Its [`Machine`] holds the
+//! handshake, the SHA-256 authentication, the request numbers, the `<Dat>`
+//! parser, `<Call>`, `<Interface>`, and the answers to server pings. The same
+//! [`Machine`] also runs over a TCP socket. This file adds only what the
+//! Android Auto channel needs:
+//!
+//! * It learns the ExLAP channel from the head unit's ServiceDiscoveryResponse. It moves to that channel if an ExLAP frame comes on a different one.
+//! * It does the `ExlapConnectionRequest` and `ExlapConnectionReturn` exchange. This exchange comes before the ExLAP `Init`. It wraps each message in `<ExlapStatement session_id="...">`. This wrapper lets several credentials share the one channel. `ExlapBeacon` retries a connection. `ExlapConnectionClosed` resets the channel.
+//! * It reassembles the fragments. It sends a frame only while a packet passes to the head unit.
+//! * It skips its own frames when they return to the hook. It reads `<Dat>` from any other ExLAP session on the channel.
+//!
+//! The hook brings up each credential as a separate session. Each credential
+//! gives a different set of URLs, and the sets overlap. The first credential
+//! that offers a URL subscribes to it. No URL is subscribed more than once.
+//!
+//! The hook sends the electric battery values (`tankLevelPrimary/level` and
+//! `outsideTemperature`) to the aa-proxy-rs `/battery` endpoint.
 
 #[allow(warnings)]
 mod bindings;
@@ -27,9 +33,8 @@ use bindings::aa::packet::types::{
 };
 use bindings::Guest;
 
-use base64::Engine as _;
-use sha2::Digest as _;
-use std::collections::HashMap;
+use exlap::{Dat, Entry, Event, Kind, Machine, Phase, Rate, Value};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -41,35 +46,24 @@ fn debug_log(msg: &str) {
     }
 }
 
-// ── Credentials (from ExlapReader.java, in index order) ──────────────────────
-
-const CREDENTIALS: &[(&str, &str)] = &[
-    (
-        "Test_TB-105000",
-        "s4T2K6BAv0a7LQvrv3vdaUl17xEl2WJOpTmAThpRZe0==",
-    ),
-    (
-        "RSE_L-CA2000",
-        "T53Facvq51jO8vQJrBNx3MqLWmPcHf/hkow7yLu7SuA==",
-    ),
-    (
-        "RSE_3-DE1400",
-        "KozPo8iE0j72pkbWXKcP0QihpxgML3Opp8fNJZ0wN24==",
-    ),
-    (
-        "ML_74-125000",
-        "Fo7arEpPhAgMMznzxRlV8B7eeZgNDIYQcy0Gr7Ad1Fg==",
-    ),
-];
-
 const DEFAULT_SUBSCRIBE_URLS: &str = "tankLevelPrimary,outsideTemperature";
+/// Default credential bring-up order, the richest credential first. The first
+/// credential here that offers a URL claims it (`exlap::divide`). A credential
+/// can offer nothing new. That credential gets no URLs and sends no Subscribe.
+/// It stays connected and answers the pings.
+const DEFAULT_CREDS: &[usize] = &[2, 1, 3, 0];
+/// Default subscription interval in milliseconds. The schema default when the
+/// attribute is omitted is 0, every change, which floods the channel on a
+/// CAN-rate signal; so every subscription states an interval.
+const DEFAULT_IVAL_MS: u32 = 2000;
 
 /// Server-heartbeat interval (seconds) requested on connect. ExLAP v1.3 allows
-/// 0–60; 0 disables the heartbeat and lets the HU leak sessions across reconnects
-/// (see the <Heartbeat> send site). Keep nonzero so dead sessions get reaped.
+/// 0-60; 0 disables the heartbeat and lets the HU leak sessions across
+/// reconnects. Keep nonzero so dead sessions get reaped; the Machine answers
+/// the pings, so only a genuinely dead session is reaped.
 const HEARTBEAT_IVAL_SECS: u8 = 10;
 
-// ── Packet flags and message IDs (mirroring mitm.rs constants) ───────────────
+// -- Packet flags and message IDs (mirroring mitm.rs constants) ---------------
 
 const ENCRYPTED: u8 = 1 << 3;
 const FRAME_TYPE_FIRST: u8 = 1 << 0; // bit 0, matches mitm.rs
@@ -82,49 +76,122 @@ const MSG_CHANNEL_OPEN_RESPONSE: u16 = 8;
 
 const EXLAP_SERVICE_NAME: &str = "com.vwag.infotainment.gal.exlap";
 
-// ── Protocol phase ────────────────────────────────────────────────────────────
+// -- Session state -------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
-enum Phase {
-    WaitChanOpen,
+/// The Android-Auto-transport phase of one multiplexed session.
+///
+/// `Pending` and `WaitConnReturn` are BEFORE ExLAP's own `Init`. They are the
+/// AA connection handshake that the socket transport does not have. Once the HU
+/// answers `ExlapConnectionReturn connected="true"`, an [`exlap::Machine`]
+/// takes over and its own [`Phase`] tracks the rest.
+enum SessionState {
+    /// Not started; waiting for its turn to send `ExlapConnectionRequest`.
+    Pending,
+    /// `ExlapConnectionRequest` sent; waiting for `ExlapConnectionReturn`.
     WaitConnReturn,
-    WaitInit,
-    WaitCapabilities,
-    WaitAuthChallenge,
-    WaitAuthResponse,
-    WaitUrlList,
-    Active,
+    /// Connected. The Machine drives the session from `Init` onward.
+    Running(Machine),
+    /// Authentication failed for this credential; do not retry it this cycle.
     Failed,
 }
 
-// ── Session state ─────────────────────────────────────────────────────────────
+/// One multiplexed ExLAP connection for a single credential (`exlap::USERS[idx]`,
+/// where idx is this session's position in `ExlapState::sessions`).
+struct Session {
+    state: SessionState,
+    /// Random hex session ID; empty until this session is started.
+    session_id: String,
+    /// True once this session has issued its `<Subscribe>` batch.
+    subscribed: bool,
+    /// Whether the HU reported `subscriptionLimitReached` for this session.
+    subscription_limit_reached: bool,
+}
 
+impl Session {
+    fn pending() -> Self {
+        Self {
+            state: SessionState::Pending,
+            session_id: String::new(),
+            subscribed: false,
+            subscription_limit_reached: false,
+        }
+    }
+
+    fn machine(&mut self) -> Option<&mut Machine> {
+        match &mut self.state {
+            SessionState::Running(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// The Machine's phase, or `None` when this session has no Machine yet.
+    fn phase(&self) -> Option<Phase> {
+        match &self.state {
+            SessionState::Running(m) => Some(m.phase()),
+            _ => None,
+        }
+    }
+
+    /// True when the session is Running and its Machine is Ready (past the
+    /// handshake and directory).
+    fn is_active(&self) -> bool {
+        self.phase() == Some(Phase::Ready)
+    }
+}
+
+/// Wrap a Machine request body for transmission on the AA channel: every ExLAP
+/// message a credential sends rides inside its own `<ExlapStatement>`.
+fn wrap(session_id: &str, req: &str) -> String {
+    format!(r#"<ExlapStatement session_id="{session_id}">{req}</ExlapStatement>"#)
+}
+
+/// The inner ExLAP message of an `<ExlapStatement>...</ExlapStatement>` wrapper,
+/// or the whole string when it carries no wrapper (a bare `<Status>`). The
+/// Machine reasons about the inner element's root tag, so it must never see the
+/// wrapper.
+fn unwrap_statement(xml: &str) -> &str {
+    let Some(open) = xml.find("<ExlapStatement") else {
+        return xml;
+    };
+    let Some(gt) = xml[open..].find('>').map(|i| open + i + 1) else {
+        return xml;
+    };
+    match xml.rfind("</ExlapStatement>") {
+        Some(close) if close >= gt => xml[gt..close].trim(),
+        _ => xml[gt..].trim(),
+    }
+}
+
+/// Channel-level state: the AA channel and all multiplexed ExLAP sessions
+/// (one per credential) sharing it.
 struct ExlapState {
     /// Which channel to intercept; overwritten from the SDR service_id on connect.
     exlap_channel: u8,
-    /// Current protocol phase.
-    phase: Phase,
-    /// Random hex session ID, regenerated on each connection.
-    session_id: String,
-    /// Monotonically increasing request ID.
-    req_id: u32,
+    /// True once we've sent the first ExlapConnectionRequest for this
+    /// channel-open cycle. Gates the channel self-heal adoption below.
+    connecting_started: bool,
     /// Fragment reassembly buffer.
     assemble_buf: Vec<u8>,
-    /// Index into CREDENTIALS table being tried.
-    cred_idx: usize,
-    /// Last tankLevelPrimary/level value received.
+    /// Credential bring-up order (preference for `divide`). Sessions are indexed
+    /// by their position here.
+    creds: Vec<usize>,
+    /// One session per credential, in `creds` order.
+    sessions: Vec<Session>,
+    /// URLs already subscribed by an earlier-up session this cycle. A later
+    /// credential subscribes only to what is not yet claimed, the `divide`
+    /// policy, applied incrementally as sessions come up in order.
+    claimed: HashSet<String>,
+    /// Last tankLevelPrimary/level value received, from any session.
     tank_level: Option<f32>,
-    /// Last outsideTemperature value received.
+    /// Last outsideTemperature value received, from any session.
     outside_temp: Option<f32>,
     /// Total battery capacity in Wh (from config), sent with every /battery POST.
     battery_capacity_wh: Option<u64>,
-    /// Whether the HU reported subscriptionLimitReached.
-    subscription_limit_reached: bool,
-    /// URLs to auto-subscribe to after URL list is received (configurable).
+    /// URLs to auto-subscribe to, or a single `*` for everything (configurable).
     subscribe_urls: Vec<String>,
-    /// Full URL list reported by the HU on connect (url + url_type per entry).
-    known_urls: Vec<serde_json::Value>,
-    /// Last received value per URL (url → {fields, timestamp}).
+    /// Subscription interval in milliseconds for every auto-subscription.
+    subscribe_ival_ms: u32,
+    /// Last received value per URL (url -> {fields, ...}), across all sessions.
     current_values: HashMap<String, serde_json::Value>,
     /// Frames queued for transmission toward the HU. host::send routes to the
     /// *current* proxy task's endpoint, and only the MD task reaches the HU, so
@@ -137,23 +204,39 @@ struct ExlapState {
 }
 
 impl ExlapState {
-    fn new(exlap_channel: u8, start_cred: usize, subscribe_urls: Vec<String>) -> Self {
+    fn new(exlap_channel: u8, creds: Vec<usize>, subscribe_urls: Vec<String>, ival: u32) -> Self {
+        let sessions = creds.iter().map(|_| Session::pending()).collect();
         Self {
             exlap_channel,
-            phase: Phase::WaitChanOpen,
-            session_id: make_session_id(),
-            req_id: 42,
+            connecting_started: false,
             assemble_buf: Vec::new(),
-            cred_idx: start_cred.min(CREDENTIALS.len() - 1),
+            creds,
+            sessions,
+            claimed: HashSet::new(),
             tank_level: None,
             outside_temp: None,
             battery_capacity_wh: None,
-            subscription_limit_reached: false,
             subscribe_urls,
-            known_urls: Vec::new(),
+            subscribe_ival_ms: ival,
             current_values: HashMap::new(),
             outbound: Vec::new(),
             recently_sent: Vec::new(),
+        }
+    }
+
+    /// The credential index for session slot `idx`.
+    fn cred(&self, idx: usize) -> usize {
+        self.creds[idx]
+    }
+
+    fn make_pkt(&self, xml: &str) -> Packet {
+        Packet {
+            proxy_type: ProxyType::MobileDevice,
+            channel: self.exlap_channel,
+            packet_flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+            final_length: None,
+            message_id: 0,
+            payload: xml.as_bytes().to_vec(),
         }
     }
 
@@ -168,38 +251,51 @@ impl ExlapState {
         self.outbound.push(pkt);
     }
 
-    fn next_id(&mut self) -> u32 {
-        let id = self.req_id;
-        self.req_id += 1;
-        id
-    }
-
-    fn make_req(&mut self, body: &str) -> String {
-        let id = self.next_id();
-        format!(
-            r#"<ExlapStatement session_id="{sid}"><Req id="{id}">{body}</Req></ExlapStatement>"#,
-            sid = self.session_id,
-        )
-    }
-
-    fn make_pkt(&self, xml: &str) -> Packet {
-        Packet {
-            proxy_type: ProxyType::MobileDevice,
-            channel: self.exlap_channel,
-            packet_flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
-            final_length: None,
-            message_id: 0,
-            payload: xml.as_bytes().to_vec(),
+    /// Flush a Machine's queued requests toward the HU, each wrapped in this
+    /// session's `<ExlapStatement>`.
+    fn flush_machine(&mut self, idx: usize) {
+        let sid = self.sessions[idx].session_id.clone();
+        let reqs = match self.sessions[idx].machine() {
+            Some(m) => m.take_outbound(),
+            None => return,
+        };
+        for req in reqs {
+            let framed = wrap(&sid, &req);
+            self.send_xml(&framed);
         }
     }
+}
 
-    fn user(&self) -> &'static str {
-        CREDENTIALS[self.cred_idx].0
+/// Start the next pending credential session, if nothing is already
+/// mid-handshake and any remain. Only one `ExlapConnectionRequest` is ever
+/// outstanding at a time, since `ExlapConnectionReturn` carries no `session_id`
+/// to demux by. Safe to call unconditionally (e.g. on every ExlapBeacon): a
+/// no-op unless there is a Pending session and nothing currently WaitConnReturn.
+fn try_start_next_session(s: &mut ExlapState) {
+    if s.sessions.iter().any(|sess| matches!(sess.state, SessionState::WaitConnReturn)) {
+        return; // an attempt is already in flight
     }
-
-    fn password(&self) -> &'static str {
-        CREDENTIALS[self.cred_idx].1
-    }
+    let Some(idx) = s
+        .sessions
+        .iter()
+        .position(|sess| matches!(sess.state, SessionState::Pending))
+    else {
+        return; // nothing left to start
+    };
+    s.connecting_started = true;
+    s.sessions[idx].session_id = make_session_id();
+    s.sessions[idx].state = SessionState::WaitConnReturn;
+    debug_log(&format!(
+        "exlap-hook: starting session cred={} user=\"{}\" session_id={}",
+        s.cred(idx),
+        exlap::USERS[s.cred(idx)],
+        s.sessions[idx].session_id
+    ));
+    let xml = format!(
+        r#"<ExlapConnectionRequest session_id="{}"/>"#,
+        s.sessions[idx].session_id
+    );
+    s.send_xml(&xml);
 }
 
 /// Generate a 16-byte random session ID as a lowercase hex string.
@@ -209,15 +305,62 @@ fn make_session_id() -> String {
     buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Parse a comma-separated URL list from config.
-fn parse_subscribe_urls(s: &str) -> Vec<String> {
-    s.split(',')
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty())
-        .collect()
+/// A fresh 16-byte client nonce, base64-encoded, what `Machine::with_cnonce`
+/// wants. WASI has no `/dev/urandom`, so the Machine's own source cannot be
+/// used here; this is `random_get` through getrandom.
+fn make_cnonce() -> String {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).unwrap_or(());
+    b64(&buf)
 }
 
-// ── Global state (single-threaded WASM) ──────────────────────────────────────
+/// Standard padded base64, for the client nonce only.
+fn b64(input: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(A[((n >> 18) & 63) as usize] as char);
+        out.push(A[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { A[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// A new Machine for a credential: the shared session core, told to ask for a
+/// server heartbeat and to take its client nonce from WASI.
+fn new_machine(cred: usize) -> Machine {
+    Machine::new(cred)
+        .with_server_heartbeat(HEARTBEAT_IVAL_SECS)
+        .with_cnonce(make_cnonce)
+        // Keep the timestamps the pre-crate hook asked for. What the head
+        // unit's wall clock actually reads here is not yet characterised, so
+        // the value is passed through to the web UI as-is, not interpreted.
+        .with_timestamps(true)
+}
+
+/// Parse a comma-separated URL list from config.
+fn parse_subscribe_urls(s: &str) -> Vec<String> {
+    s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect()
+}
+
+/// Parse a comma-separated credential index list; falls back to the default.
+fn parse_creds(s: &str) -> Vec<usize> {
+    let v: Vec<usize> = s
+        .split(',')
+        .filter_map(|u| u.trim().parse::<usize>().ok())
+        .filter(|&i| i < exlap::USERS.len())
+        .collect();
+    if v.is_empty() {
+        DEFAULT_CREDS.to_vec()
+    } else {
+        v
+    }
+}
+
+// -- Global state (single-threaded WASM) --------------------------------------
 
 static STATE: OnceLock<Mutex<ExlapState>> = OnceLock::new();
 
@@ -227,7 +370,7 @@ fn with_state<R>(f: impl FnOnce(&mut ExlapState) -> R) -> R {
     f(&mut guard)
 }
 
-// ── WIT bindings export ───────────────────────────────────────────────────────
+// -- WIT bindings export -------------------------------------------------------
 
 struct ExlapHook;
 
@@ -236,16 +379,21 @@ impl Guest for ExlapHook {
         let channel: u8 = host::get_config("exlap_channel")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0x7E);
-        let start_cred: usize = host::get_config("exlap_cred_idx")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0usize);
+        let creds = host::get_config("exlap_creds")
+            .map(|s| parse_creds(&s))
+            .unwrap_or_else(|| DEFAULT_CREDS.to_vec());
         let subscribe_urls = parse_subscribe_urls(
             &host::get_config("exlap_subscribe_urls")
                 .unwrap_or_else(|| DEFAULT_SUBSCRIBE_URLS.to_string()),
         );
+        let ival = host::get_config("exlap_subscribe_ival_ms")
+            .and_then(|s| s.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_IVAL_MS);
 
         let battery_capacity_wh: Option<u64> = host::get_config("exlap_battery_capacity_wh")
-            .and_then(|s| s.parse().ok());
+            .and_then(|s| s.parse().ok())
+            .filter(|&v| v > 0);
 
         let debug = host::get_config("exlap_debug")
             .map(|v| v == "true" || v == "1")
@@ -253,35 +401,31 @@ impl Guest for ExlapHook {
         DEBUG_LOG.store(debug, Ordering::Relaxed);
 
         debug_log(&format!(
-            "exlap-hook: created channel={:#04x} cred={} subscribe_urls={:?} battery_capacity_wh={:?}",
-            channel, start_cred, subscribe_urls, battery_capacity_wh
+            "exlap-hook: created channel={:#04x} creds={:?} subscribe_urls={:?} ival={}ms battery_capacity_wh={:?}",
+            channel, creds, subscribe_urls, ival, battery_capacity_wh
         ));
 
-        let mut state = ExlapState::new(channel, start_cred, subscribe_urls);
+        let mut state = ExlapState::new(channel, creds, subscribe_urls, ival);
         state.battery_capacity_wh = battery_capacity_wh;
         STATE.set(Mutex::new(state)).ok();
     }
 
     fn on_destroy() {
-        // Send <Bye/> so the HU cleans up the session (spec §3.5.8: client SHOULD send Bye).
-        let active = with_state(|s| {
-            matches!(
-                s.phase,
-                Phase::Active
-                    | Phase::WaitUrlList
-                    | Phase::WaitAuthResponse
-                    | Phase::WaitAuthChallenge
-                    | Phase::WaitCapabilities
-                    | Phase::WaitInit
-                    | Phase::WaitConnReturn
-            )
+        // Send <Bye/> on every still-connected session so the HU cleans them up
+        // (spec section 3.5.8: client SHOULD send Bye).
+        with_state(|s| {
+            for idx in 0..s.sessions.len() {
+                if let Some(m) = s.sessions[idx].machine() {
+                    m.bye();
+                }
+                s.flush_machine(idx);
+            }
+            // Bye goes out directly here (on_destroy has no dir=MD carrier).
+            let pkts = std::mem::take(&mut s.outbound);
+            for p in &pkts {
+                host::send(p);
+            }
         });
-        if active {
-            with_state(|s| {
-                let req = s.make_req("<Bye/>");
-                host::send(&s.make_pkt(&req));
-            });
-        }
         debug_log("exlap-hook: destroyed");
     }
 
@@ -298,11 +442,14 @@ impl Guest for ExlapHook {
                     values: None,
                 },
                 CustomConfigEntry {
-                    name: "exlap_cred_idx".to_string(),
-                    typ: "u8".to_string(),
-                    description: "Credential index to try first (0–3; hook tries all on failure)"
-                        .to_string(),
-                    default_value: "0".to_string(),
+                    name: "exlap_creds".to_string(),
+                    typ: "string".to_string(),
+                    description:
+                        "Comma-separated credential indices (0-3) to bring up, in preference \
+                         order, a URL is subscribed by the first credential here that offers \
+                         it. Default: 2,1,3,0."
+                            .to_string(),
+                    default_value: "2,1,3,0".to_string(),
                     values: None,
                 },
                 CustomConfigEntry {
@@ -310,11 +457,22 @@ impl Guest for ExlapHook {
                     typ: "string".to_string(),
                     description: format!(
                         "Comma-separated ExLAP URLs to subscribe to, or \"*\" to subscribe \
-                         to every URL the HU exposes. \
+                         to every URL the credentials expose (deduplicated across them). \
                          tankLevelPrimary/level and outsideTemperature also feed POST /battery. \
                          Default: {DEFAULT_SUBSCRIBE_URLS}"
                     ),
                     default_value: DEFAULT_SUBSCRIBE_URLS.to_string(),
+                    values: None,
+                },
+                CustomConfigEntry {
+                    name: "exlap_subscribe_ival_ms".to_string(),
+                    typ: "u32".to_string(),
+                    description:
+                        "Minimum interval between pushes for each subscription, milliseconds. \
+                         0 in the protocol means every change, which floods the channel, so \
+                         a nonzero default is used. Default: 2000."
+                            .to_string(),
+                    default_value: "2000".to_string(),
                     values: None,
                 },
                 CustomConfigEntry {
@@ -345,30 +503,34 @@ impl Guest for ExlapHook {
             "exlap_channel" => {
                 if let Ok(ch) = value.parse::<u8>() {
                     s.exlap_channel = ch;
-                    debug_log(&format!("exlap-hook: exlap_channel → {:#04x}", ch));
+                    debug_log(&format!("exlap-hook: exlap_channel -> {:#04x}", ch));
                 }
             }
-            "exlap_cred_idx" => {
-                if let Ok(idx) = value.parse::<usize>() {
-                    let idx = idx.min(CREDENTIALS.len() - 1);
-                    s.cred_idx = idx;
-                    debug_log(&format!("exlap-hook: exlap_cred_idx → {}", idx));
-                }
+            "exlap_creds" => {
+                let creds = parse_creds(&value);
+                debug_log(&format!("exlap-hook: exlap_creds -> {:?} (applies next reconnect)", creds));
+                s.creds = creds;
             }
             "exlap_subscribe_urls" => {
                 let urls = parse_subscribe_urls(&value);
-                debug_log(&format!("exlap-hook: exlap_subscribe_urls → {:?}", urls));
+                debug_log(&format!("exlap-hook: exlap_subscribe_urls -> {:?}", urls));
                 s.subscribe_urls = urls;
+            }
+            "exlap_subscribe_ival_ms" => {
+                if let Some(v) = value.parse::<u32>().ok().filter(|&v| v > 0) {
+                    s.subscribe_ival_ms = v;
+                    debug_log(&format!("exlap-hook: exlap_subscribe_ival_ms -> {}", v));
+                }
             }
             "exlap_battery_capacity_wh" => {
                 let cap = value.parse::<u64>().ok().filter(|&v| v > 0);
                 s.battery_capacity_wh = cap;
-                debug_log(&format!("exlap-hook: exlap_battery_capacity_wh → {:?}", cap));
+                debug_log(&format!("exlap-hook: exlap_battery_capacity_wh -> {:?}", cap));
             }
             "exlap_debug" => {
                 let enabled = value == "true" || value == "1";
                 DEBUG_LOG.store(enabled, Ordering::Relaxed);
-                host::info(&format!("exlap-hook: exlap_debug → {}", enabled));
+                host::info(&format!("exlap-hook: exlap_debug -> {}", enabled));
             }
             _ => {}
         });
@@ -377,15 +539,15 @@ impl Guest for ExlapHook {
     fn modify_packet(_ctx: ModifyContext, pkt: Packet, _cfg: ConfigView) -> Decision {
         // Flush any queued ExLAP frames toward the HU. host::send routes to the
         // current proxy task's endpoint, and only the MD task (dir=MD) reaches
-        // the HU — so we can only emit during a dir=MD invocation. Any dir=MD
-        // packet is a usable carrier (phone→HU video is a constant stream), so
+        // the HU, so we can only emit during a dir=MD invocation. Any dir=MD
+        // packet is a usable carrier (phone->HU video is a constant stream), so
         // flush latency is negligible. Done before the channel filter on purpose.
         if pkt.proxy_type == ProxyType::MobileDevice {
             flush_outbound();
         }
 
-        // Intercept the HU's ServiceDiscoveryResponse so we can open the ExLAP
-        // channel ourselves — no host-side ExLAP code required.
+        // Intercept the HU's ServiceDiscoveryResponse so we can learn the ExLAP
+        // channel, no host-side ExLAP code required.
         if pkt.proxy_type == ProxyType::HeadUnit
             && pkt.channel == 0
             && pkt.message_id == MSG_SERVICE_DISCOVERY_RESPONSE
@@ -397,17 +559,15 @@ impl Guest for ExlapHook {
         // Self-heal the ExLAP channel. The channel is normally learned from the
         // SDR, but a mid-session hot-reload (or a missed SDR) leaves the hook on
         // the config default and deaf to the real ExLAP channel. ExLAP frames are
-        // plain "<Exlap…" XML, so if we see one on a channel we aren't tracking
-        // and we're not yet connected, adopt that channel. Cheap prefix check on
-        // data frames only; gated to WaitChanOpen so we never hijack a live
-        // session. This lets the very same beacon both teach the channel and
-        // drive the connect below.
+        // plain "<Exlap..." XML, so if we see one on a channel we aren't tracking
+        // and we haven't started connecting yet, adopt that channel. Cheap prefix
+        // check on data frames only; gated so we never hijack a live session.
         if pkt.channel != 0
             && (pkt.packet_flags & CONTROL_FLAG) == 0
             && pkt.payload.starts_with(b"<Exlap")
         {
             with_state(|s| {
-                if s.phase == Phase::WaitChanOpen && s.exlap_channel != pkt.channel {
+                if !s.connecting_started && s.exlap_channel != pkt.channel {
                     host::info(&format!(
                         "exlap-hook: adopting ExLAP channel {:#04x} from observed ExLAP frame",
                         pkt.channel
@@ -425,12 +585,12 @@ impl Guest for ExlapHook {
         process_packet(pkt);
         // NEVER return Decision::Drop here. In this host build a wasm "Drop" is
         // not a discard: run_wasm_hooks maps it to PacketAction::SendBack, which
-        // re-queues the packet into the *other* proxy task's rx arm — where this
-        // same hook runs again and drops it again, forever (confirmed: a single
-        // injected CHANNEL_OPEN_REQUEST ping-ponged the two tasks in a tight
-        // busy-loop, starving the shared proxy task and stalling video). Forward
-        // terminates (encrypt + transmit), so every packet passes through the
-        // hook a bounded number of times. We consume purely via side-effects.
+        // re-queues the packet into the *other* proxy task's rx arm, where this
+        // same hook runs again and drops it again, forever (confirmed upstream: a
+        // single injected CHANNEL_OPEN_REQUEST ping-ponged the two tasks in a
+        // tight busy-loop, starving the shared proxy task and stalling video).
+        // Forward terminates (encrypt + transmit), so every packet passes through
+        // the hook a bounded number of times. We consume purely via side-effects.
         Decision::Forward
     }
 
@@ -444,69 +604,66 @@ impl Guest for ExlapHook {
         };
 
         let cmd = val.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+        let url = || val.get("url").and_then(|v| v.as_str()).map(|u| u.to_string());
 
         match cmd {
             "subscribe" => {
-                let url = match val.get("url").and_then(|v| v.as_str()) {
-                    Some(u) => u.to_string(),
-                    None => return "error: missing url".to_string(),
-                };
+                let Some(u) = url() else { return "error: missing url".to_string() };
                 with_state(|s| {
-                    if s.phase != Phase::Active {
-                        return format!("error: not active (phase={:?})", s.phase);
-                    }
-                    let body = format!(r#"<Subscribe url="{}" timeStamp="true"/>"#, url);
-                    let xml = s.make_req(&body);
-                    s.send_xml(&xml);
-                    debug_log(&format!("exlap-hook: ws subscribe → {}", url));
-                    "ok".to_string()
+                    let ival = s.subscribe_ival_ms;
+                    broadcast(s, "subscribe", &u, |m| {
+                        m.subscribe_one(&u, ival);
+                    })
                 })
             }
             "unsubscribe" => {
-                let url = match val.get("url").and_then(|v| v.as_str()) {
-                    Some(u) => u.to_string(),
-                    None => return "error: missing url".to_string(),
-                };
-                with_state(|s| {
-                    if s.phase != Phase::Active {
-                        return format!("error: not active (phase={:?})", s.phase);
-                    }
-                    let body = format!(r#"<Unsubscribe url="{}"/>"#, url);
-                    let xml = s.make_req(&body);
-                    s.send_xml(&xml);
-                    debug_log(&format!("exlap-hook: ws unsubscribe → {}", url));
-                    "ok".to_string()
-                })
+                let Some(u) = url() else { return "error: missing url".to_string() };
+                with_state(|s| broadcast(s, "unsubscribe", &u, |m| {
+                    m.request(&format!(r#"<Unsubscribe url="{}"/>"#, exlap::escape_attr(&u)));
+                }))
             }
             "get" => {
-                let url = match val.get("url").and_then(|v| v.as_str()) {
-                    Some(u) => u.to_string(),
-                    None => return "error: missing url".to_string(),
-                };
-                with_state(|s| {
-                    if s.phase != Phase::Active {
-                        return format!("error: not active (phase={:?})", s.phase);
-                    }
-                    let body = format!(r#"<Get url="{}" timeStamp="true"/>"#, url);
-                    let xml = s.make_req(&body);
-                    s.send_xml(&xml);
-                    debug_log(&format!("exlap-hook: ws get → {}", url));
-                    "ok".to_string()
-                })
+                let Some(u) = url() else { return "error: missing url".to_string() };
+                with_state(|s| broadcast(s, "get", &u, |m| {
+                    m.request(&format!(r#"<Get url="{}" timeStamp="true"/>"#, exlap::escape_attr(&u)));
+                }))
+            }
+            "call" => {
+                // A function call: {cmd:"call", url:"Sound_Mute", params:[{kind,name,val}]}
+                let Some(u) = url() else { return "error: missing url".to_string() };
+                let params = parse_params(val.get("params"));
+                let body = exlap::call(&u, &params);
+                with_state(|s| broadcast(s, "call", &u, |m| {
+                    m.request(&body);
+                }))
+            }
+            "interface" => {
+                let Some(u) = url() else { return "error: missing url".to_string() };
+                let body = exlap::interface(&u);
+                with_state(|s| broadcast(s, "interface", &u, |m| {
+                    m.request(&body);
+                }))
             }
             "list" => with_state(|s| {
-                let snapshot = serde_json::json!({
-                    "connection_state": phase_str(&s.phase),
-                    "subscription_limit_reached": s.subscription_limit_reached,
-                    "urls": s.known_urls,
-                });
+                let sessions: Vec<_> = (0..s.sessions.len())
+                    .map(|idx| {
+                        let cred = s.cred(idx);
+                        let urls = url_list_json(&s.sessions[idx]);
+                        serde_json::json!({
+                            "cred_idx": cred,
+                            "user": exlap::USERS[cred],
+                            "connection_state": conn_state(&s.sessions[idx]),
+                            "subscription_limit_reached": s.sessions[idx].subscription_limit_reached,
+                            "urls": urls,
+                        })
+                    })
+                    .collect();
+                let snapshot = serde_json::json!({ "sessions": sessions });
                 host::send_ws_event("exlap", &snapshot.to_string());
                 "ok".to_string()
             }),
             "values" => with_state(|s| {
-                let snapshot = serde_json::json!({
-                    "current_values": s.current_values,
-                });
+                let snapshot = serde_json::json!({ "current_values": s.current_values });
                 host::send_ws_event("exlap", &snapshot.to_string());
                 "ok".to_string()
             }),
@@ -517,7 +674,53 @@ impl Guest for ExlapHook {
 
 bindings::export!(ExlapHook with_types_in bindings);
 
-// ── Packet processing ─────────────────────────────────────────────────────────
+/// Run `f` on every Running session's Machine, flush each, and report how many
+/// answered. The HU replies `noMatchingUrl` on a session that lacks the url, so
+/// this is safe even if only some credentials expose it.
+fn broadcast(
+    s: &mut ExlapState,
+    verb: &str,
+    url: &str,
+    mut f: impl FnMut(&mut Machine),
+) -> String {
+    let running: Vec<usize> =
+        (0..s.sessions.len()).filter(|&i| s.sessions[i].is_active()).collect();
+    if running.is_empty() {
+        return "error: no active sessions".to_string();
+    }
+    for idx in &running {
+        if let Some(m) = s.sessions[*idx].machine() {
+            f(m);
+        }
+        s.flush_machine(*idx);
+    }
+    debug_log(&format!("exlap-hook: ws {verb} -> {url} ({} sessions)", running.len()));
+    "ok".to_string()
+}
+
+/// Parse `params` from a ws `call` command into ExLAP value elements.
+/// Each is `{"kind":"Enm","name":"Source","val":"HDD"}`; kind defaults to Txt.
+fn parse_params(v: Option<&serde_json::Value>) -> Vec<Value> {
+    let Some(arr) = v.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|p| {
+            let name = p.get("name").and_then(|v| v.as_str())?.to_string();
+            let raw = p.get("val").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let kind = match p.get("kind").and_then(|v| v.as_str()).unwrap_or("Txt") {
+                "Abs" => Kind::Abs,
+                "Rel" => Kind::Rel,
+                "Act" => Kind::Act,
+                "Enm" => Kind::Enm,
+                _ => Kind::Txt,
+            };
+            Some(Value { kind, name, raw })
+        })
+        .collect()
+}
+
+// -- Packet processing ---------------------------------------------------------
 
 fn dir_str(pt: ProxyType) -> &'static str {
     match pt {
@@ -536,10 +739,7 @@ fn process_packet(pkt: Packet) {
             .get(0..2)
             .map(|b| u16::from_be_bytes([b[0], b[1]]))
             .unwrap_or(0);
-        debug_log(&format!(
-            "exlap-hook: ch pkt dir={} CONTROL msg_id={:#06x}",
-            dir, msg_id
-        ));
+        debug_log(&format!("exlap-hook: ch pkt dir={} CONTROL msg_id={:#06x}", dir, msg_id));
         handle_control(&pkt);
         return;
     }
@@ -560,9 +760,7 @@ fn process_packet(pkt: Packet) {
     }
 
     let xml = with_state(|s| {
-        let result = std::str::from_utf8(&s.assemble_buf)
-            .map(|x| x.to_owned())
-            .ok();
+        let result = std::str::from_utf8(&s.assemble_buf).map(|x| x.to_owned()).ok();
         s.assemble_buf.clear();
         result
     });
@@ -586,25 +784,18 @@ fn process_packet(pkt: Packet) {
 
     // Only drive the state machine from HU-originated frames. Every HU response
     // is seen twice: once as dir=HU (ingress from the HU) and again as dir=MD
-    // when we Forward that same frame on toward the phone. Acting on both would
-    // process every message twice — e.g. the dir=MD echo of the auth Challenge
-    // would hit the WaitAuthResponse handler and be misread as a failed auth,
-    // racing ahead of the real dir=HU response. Real ExLAP responses are always
-    // dir=HU (the HU is the server), so ignore the dir=MD duplicates.
+    // when we Forward that same frame on toward the phone. Real ExLAP responses
+    // are always dir=HU (the HU is the server), so ignore the dir=MD duplicates.
     if pkt.proxy_type != ProxyType::HeadUnit {
         debug_log(&format!(
-            "exlap-hook: ch DATA dir={} (forwarded HU→phone duplicate, not acted on): {}",
+            "exlap-hook: ch DATA dir={} (forwarded HU->phone duplicate, not acted on): {}",
             dir,
             truncate_xml(&xml, 120)
         ));
         return;
     }
 
-    debug_log(&format!(
-        "exlap-hook: ch DATA dir={} xml: {}",
-        dir,
-        truncate_xml(&xml, 480)
-    ));
+    debug_log(&format!("exlap-hook: ch DATA dir={} xml: {}", dir, truncate_xml(&xml, 480)));
     handle_xml(&xml);
 }
 
@@ -614,7 +805,7 @@ fn truncate_xml(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         let head: String = s.chars().take(n).collect();
-        format!("{}…(+{} chars)", head, s.chars().count() - n)
+        format!("{}...(+{} chars)", head, s.chars().count() - n)
     }
 }
 
@@ -625,10 +816,7 @@ fn flush_outbound() {
     if pkts.is_empty() {
         return;
     }
-    debug_log(&format!(
-        "exlap-hook: flushing {} queued frame(s) → HU",
-        pkts.len()
-    ));
+    debug_log(&format!("exlap-hook: flushing {} queued frame(s) -> HU", pkts.len()));
     for p in &pkts {
         host::send(p);
     }
@@ -654,14 +842,14 @@ fn handle_control(pkt: &Packet) {
     let status = if pkt.payload.len() >= 4 && pkt.payload[2] == 0x08 {
         pkt.payload[3] as i32
     } else {
-        0 // field absent → default STATUS_OK
+        0 // field absent -> default STATUS_OK
     };
 
     with_state(|s| {
-        if s.phase != Phase::WaitChanOpen {
+        if s.connecting_started {
             debug_log(&format!(
-                "exlap-hook: unexpected CHANNEL_OPEN_RESPONSE in phase {:?} (status={})",
-                s.phase, status
+                "exlap-hook: unexpected CHANNEL_OPEN_RESPONSE (already connecting, status={})",
+                status
             ));
             return;
         }
@@ -672,34 +860,22 @@ fn handle_control(pkt: &Packet) {
                  channel open may have failed",
                 status, s.exlap_channel
             ));
-            // Proceed anyway — some HUs return non-zero but still open the channel.
+            // Proceed anyway, some HUs return non-zero but still open the channel.
         }
 
         debug_log(&format!(
-            "exlap-hook: channel {:#04x} open (status={}); \
-             sending ExlapConnectionRequest cred={} (\"{}\")",
+            "exlap-hook: channel {:#04x} open (status={}); bringing up {} credential sessions",
             s.exlap_channel,
             status,
-            s.cred_idx,
-            s.user()
+            s.sessions.len()
         ));
-        send_exlap_connection_request(s);
+        try_start_next_session(s);
     });
 }
 
-/// Send a fresh `<ExlapConnectionRequest>` and enter WaitConnReturn. Regenerates
-/// the session_id so every connect attempt (initial or beacon-driven retry) is
-/// distinct and not confused with a stale prior attempt's responses.
-fn send_exlap_connection_request(s: &mut ExlapState) {
-    s.session_id = make_session_id();
-    s.phase = Phase::WaitConnReturn;
-    let xml = format!(r#"<ExlapConnectionRequest session_id="{}"/>"#, s.session_id);
-    s.send_xml(&xml);
-}
-
 /// Intercept the HU's ServiceDiscoveryResponse, find the ExLAP vendor service,
-/// and send a CHANNEL_OPEN_REQUEST. Resets state on every SDR to handle
-/// reconnections cleanly.
+/// and learn its channel. Resets state on every SDR to handle reconnections
+/// cleanly.
 fn handle_sdr(pkt: &Packet) {
     if pkt.payload.len() < 2 {
         return;
@@ -709,26 +885,26 @@ fn handle_sdr(pkt: &Packet) {
 
     match find_exlap_service_id(proto) {
         None => {
-            debug_log("exlap-hook: SDR received — ExLAP service not found");
+            debug_log("exlap-hook: SDR received,ExLAP service not found");
         }
         Some(service_id) => {
             let channel = service_id as u8;
             with_state(|s| {
-                // Reset on every SDR — handles phone reconnections gracefully.
-                // Preserve cred_idx (avoid retrying known-bad creds) and subscribe_urls.
-                let cred_idx = s.cred_idx;
+                // Reset on every SDR, handles phone reconnections gracefully.
+                // Preserve the config: creds, subscribe_urls, ival, capacity.
+                let creds = s.creds.clone();
                 let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
-                *s = ExlapState::new(channel, cred_idx, subscribe_urls);
+                let ival = s.subscribe_ival_ms;
+                let battery_capacity_wh = s.battery_capacity_wh;
+                *s = ExlapState::new(channel, creds, subscribe_urls, ival);
+                s.battery_capacity_wh = battery_capacity_wh;
 
                 // We do NOT open the channel ourselves: the phone (Gearhead)
                 // opens every SDR-advertised service, including this one, and the
                 // HU's CHANNEL_OPEN_RESPONSE to *that* is what drives us into
-                // WaitConnReturn (see handle_control). Sending our own open here
-                // would (a) go the wrong way — handle_sdr runs in the HU task, so
-                // host::send reaches the phone, not the HU — and (b) risk a
-                // double-open on a channel the phone already opened.
+                // bringing up sessions (see handle_control).
                 debug_log(&format!(
-                    "exlap-hook: SDR found ExLAP service_id={} → ch={:#04x}; \
+                    "exlap-hook: SDR found ExLAP service_id={} -> ch={:#04x}; \
                      waiting for phone to open the channel",
                     service_id, channel
                 ));
@@ -744,127 +920,119 @@ fn handle_xml(xml: &str) {
         "ExlapBeacon" => {
             // The HU emits ExlapBeacon (~every 5s) to advertise that its ExLAP
             // server is up and accepting connections. Use it as the (re)connect
-            // trigger/retry: if we are not yet connected, send a fresh
-            // ExlapConnectionRequest. This is the recovery path for two cases the
-            // CHANNEL_OPEN_RESPONSE trigger alone cannot handle:
-            //   1. First connect lost the race — we fired the request before the
-            //      HU's ExLAP/SAI server was ready and got connected="false".
-            //   2. Reconnect within the same AA session — the channel is already
-            //      open, so no new CHANNEL_OPEN_RESPONSE arrives to drive us.
-            // Receiving a beacon proves the channel is open and the server is
-            // ready, so this is always a safe moment to (re)issue the request.
-            // Mirrors ExlapReader.java's connect-retry loop. We only retry from
-            // WaitChanOpen (idle / post-reset) so we never race an in-flight
-            // handshake (WaitConnReturn) or a live session.
-            with_state(|s| {
-                if s.phase == Phase::WaitChanOpen {
-                    debug_log("exlap-hook: ExlapBeacon — (re)sending ExlapConnectionRequest");
-                    send_exlap_connection_request(s);
-                }
-            });
+            // trigger/retry, try_start_next_session is a no-op unless there is
+            // a Pending session and nothing already mid-handshake. This is the
+            // recovery path for cases the CHANNEL_OPEN_RESPONSE trigger alone
+            // cannot handle: a connect attempt that lost the race (HU's ExLAP
+            // server wasn't ready and returned connected="false"), or a session
+            // that needs retrying within the same AA session (no new
+            // CHANNEL_OPEN_RESPONSE will arrive for an already-open channel).
+            with_state(try_start_next_session);
         }
         "ExlapConnectionClosed" => {
-            debug_log("exlap-hook: HU closed ExLAP connection");
+            // Not part of the public EXLAP spec and carries no session_id, so its
+            // scope is unclear. Treat it conservatively as closing the whole
+            // multiplexed channel: reset every session and restart bring-up (the
+            // AA channel itself stays open, so no need to wait for another SDR).
+            debug_log("exlap-hook: HU closed ExLAP connection(s); restarting all sessions");
             with_state(|s| {
-                // Preserve subscribe_urls and cred_idx across reconnect.
-                let cred_idx = s.cred_idx;
-                let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
-                let channel = s.exlap_channel;
-                *s = ExlapState::new(channel, cred_idx, subscribe_urls);
-                push_connection_state(s);
+                reset_sessions(s);
+                try_start_next_session(s);
             });
         }
         "ExlapConnectionReturn" => {
             with_state(|s| {
-                if s.phase != Phase::WaitConnReturn {
-                    debug_log(&format!(
-                        "exlap-hook: unexpected ExlapConnectionReturn in phase {:?}",
-                        s.phase
-                    ));
+                let Some(idx) = s
+                    .sessions
+                    .iter()
+                    .position(|sess| matches!(sess.state, SessionState::WaitConnReturn))
+                else {
+                    debug_log("exlap-hook: unexpected ExlapConnectionReturn (none awaiting one)");
                     return;
-                }
+                };
                 let connected = xml_attr_in_tag(xml, "ExlapConnectionReturn", "connected")
                     .map(|v| v == "true")
                     .unwrap_or(false);
                 if !connected {
                     // The HU rejects the connection when its ExLAP/SAI server
-                    // isn't ready yet (lost the startup race). Don't fail
-                    // permanently: reset to WaitChanOpen with a fresh session_id
-                    // and let the next ExlapBeacon retry the connect. The server
-                    // beacons (~every 5s) once it is ready.
-                    host::error(
-                        "exlap-hook: ExlapConnectionReturn connected=false; \
+                    // isn't ready yet (lost the startup race). Don't fail this
+                    // credential permanently: reset it to Pending and let the
+                    // next ExlapBeacon retry the connect.
+                    host::error(&format!(
+                        "exlap-hook: ExlapConnectionReturn connected=false for cred={}; \
                          retrying on next ExlapBeacon",
-                    );
-                    let cred_idx = s.cred_idx;
-                    let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
-                    let channel = s.exlap_channel;
-                    *s = ExlapState::new(channel, cred_idx, subscribe_urls);
-                    push_connection_state(s);
+                        s.cred(idx)
+                    ));
+                    s.sessions[idx] = Session::pending();
                     return;
                 }
-                debug_log("exlap-hook: ExLAP connection established; waiting for Init");
-                s.phase = Phase::WaitInit;
-                push_connection_state(s);
+                // Connected: the Machine takes over from ExLAP's own Init.
+                debug_log(&format!(
+                    "exlap-hook: ExLAP connection established for cred={}; waiting for Init",
+                    s.cred(idx)
+                ));
+                let cred = s.cred(idx);
+                let sid = s.sessions[idx].session_id.clone();
+                s.sessions[idx].state = SessionState::Running(new_machine(cred));
+                push_connection_state(s, idx);
+                debug_log(&format!("exlap-hook: session_id={sid} now Running (awaiting Init)"));
             });
         }
         "ExlapStatement" => {
             let sid = xml_attr_in_tag(xml, "ExlapStatement", "session_id").unwrap_or_default();
-            let our_sid = with_state(|s| s.session_id.clone());
-            if sid != our_sid {
-                // Not our session — don't let it drive our connection/auth state
-                // machine. But <Dat> frames are self-describing (url + fields +
-                // timestamp), so we can still passively HARVEST measurements from
-                // any other session on the channel: an orphaned session, or a
-                // phone-side ExLAP client. This means we keep feeding values (e.g.
-                // tankLevelPrimary → POST /battery) even when our own session is
-                // wedged or we never got a connection slot. We only read Dat here;
-                // control frames (auth/Bye/Alive) for the foreign session are
-                // ignored by process_dat_messages.
-                debug_log(&format!(
-                    "exlap-hook: harvesting Dat from foreign session_id={:?} (ours={:?})",
-                    sid, our_sid
-                ));
-                process_dat_messages(xml);
+            let idx = with_state(|s| {
+                s.sessions.iter().position(|sess| sess.session_id == sid && !sid.is_empty())
+            });
+            let Some(idx) = idx else {
+                // Not one of our sessions. <Dat> frames are self-describing (url +
+                // fields + timestamp), so passively HARVEST measurements from any
+                // other session on the channel: an orphaned session, or a
+                // phone-side ExLAP client.
+                debug_log(&format!("exlap-hook: harvesting Dat from foreign session_id={:?}", sid));
+                harvest_foreign(xml);
                 return;
-            }
-            advance_statement(xml);
+            };
+            feed_session(idx, unwrap_statement(xml));
         }
-        // Bare <Status> elements (Init/Alive/Bye/Dataloss) sent outside ExlapStatement.
-        "Status" => {
-            handle_status_element(xml);
-        }
-        other => {
-            debug_log(&format!("exlap-hook: unknown root element <{}>", other));
-        }
+        // Bare <Status> elements (Init/Alive/Bye/Dataloss) sent outside an
+        // ExlapStatement. These carry no session_id.
+        "Status" => handle_status_element(xml),
+        other => debug_log(&format!("exlap-hook: unknown root element <{}>", other)),
     }
 }
 
-/// Dispatch a bare `<Status>...</Status>` element (not wrapped in ExlapStatement).
+/// A bare `<Status>...</Status>` (no session_id), ambiguous once several sessions
+/// share the channel. Init belongs to whichever session is mid-handshake (only
+/// one is, since bring-up is serial); Alive is answered for every running
+/// session; Bye has no safe single target, so it resets everything.
 fn handle_status_element(xml: &str) {
     if xml.contains("Alive") {
         with_state(|s| {
-            let req = s.make_req("<Alive/>");
-            s.send_xml(&req);
-            debug_log("exlap-hook: Alive ping → queued <Alive/>");
+            for idx in 0..s.sessions.len() {
+                if matches!(s.sessions[idx].state, SessionState::Running(_)) {
+                    // Feeding the Status to the Machine makes it queue an <Alive/>.
+                    let _ = feed_machine(s, idx, "<Status><Alive/></Status>");
+                }
+            }
+            debug_log("exlap-hook: bare Alive ping -> answered for all running sessions");
         });
     } else if xml.contains("Bye") {
-        debug_log("exlap-hook: HU sent Bye via Status element; resetting");
+        debug_log("exlap-hook: HU sent bare Bye (no session_id); resetting all sessions");
         with_state(|s| {
-            let cred_idx = s.cred_idx;
-            let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
-            let channel = s.exlap_channel;
-            *s = ExlapState::new(channel, cred_idx, subscribe_urls);
-            push_connection_state(s);
+            reset_sessions(s);
+            try_start_next_session(s);
         });
     } else if xml.contains("Init") {
-        // Bare <Status>Init</Status> — treat same as wrapped Init.
-        debug_log("exlap-hook: got bare <Status>Init</Status>; sending Protocol request");
+        // Route to the session whose Machine is still awaiting Init.
         with_state(|s| {
-            let req = s.make_req(r#"<Protocol version="1" returnCapabilities="true"/>"#);
-            s.phase = Phase::WaitCapabilities;
-            push_connection_state(s);
-            s.send_xml(&req);
+            let idx = (0..s.sessions.len())
+                .find(|&i| s.sessions[i].phase() == Some(Phase::Init));
+            let Some(idx) = idx else {
+                debug_log("exlap-hook: bare Init with no session awaiting one (ignored)");
+                return;
+            };
+            debug_log(&format!("exlap-hook: bare Init for cred={}", s.cred(idx)));
+            let _ = feed_machine(s, idx, xml);
         });
     } else if xml.contains("Dataloss") {
         debug_log("exlap-hook: HU reported Dataloss on ExLAP channel");
@@ -873,484 +1041,281 @@ fn handle_status_element(xml: &str) {
     }
 }
 
-fn advance_statement(xml: &str) {
-    // Handle keepalive pings and Bye in any phase — these can arrive at any time.
-    // Format inside ExlapStatement: <Status>Alive</Status> or <Alive/>.
-    if xml.contains(">Alive<") || xml.contains("<Alive") {
-        with_state(|s| {
-            let req = s.make_req("<Alive/>");
-            s.send_xml(&req);
-        });
-        // Don't return — the packet may also contain other elements.
-        return;
-    }
-    if xml.contains(">Bye<") || xml.contains("<Bye") {
-        debug_log("exlap-hook: HU sent Bye; resetting ExLAP connection");
-        with_state(|s| {
-            let cred_idx = s.cred_idx;
-            let subscribe_urls = std::mem::take(&mut s.subscribe_urls);
-            let channel = s.exlap_channel;
-            *s = ExlapState::new(channel, cred_idx, subscribe_urls);
-            push_connection_state(s);
-        });
-        return;
-    }
-    if xml.contains(">Dataloss<") {
-        debug_log("exlap-hook: HU reported Dataloss");
-        return;
-    }
+/// Feed one unwrapped ExLAP message to session `idx`'s Machine and act on the
+/// events it produces. `inner` is the content inside the `<ExlapStatement>` (or
+/// a bare `<Status>`), never the wrapper.
+fn feed_session(idx: usize, inner: &str) {
+    with_state(|s| {
+        let _ = feed_machine(s, idx, inner);
+    });
+}
 
-    let phase = with_state(|s| s.phase.clone());
-
-    match phase {
-        Phase::WaitInit => {
-            if xml.contains("<Init") || xml.contains(">Init<") {
-                debug_log("exlap-hook: got <Init>; sending Protocol request");
-                with_state(|s| {
-                    let req = s.make_req(r#"<Protocol version="1" returnCapabilities="true"/>"#);
-                    s.phase = Phase::WaitCapabilities;
-                    push_connection_state(s);
-                    s.send_xml(&req);
-                });
+/// Drive session `idx`'s Machine with `inner`, flush what it wants sent, and
+/// handle the resulting events. Returns false if the session is not Running.
+fn feed_machine(s: &mut ExlapState, idx: usize, inner: &str) -> bool {
+    let events = match s.sessions[idx].machine() {
+        Some(m) => match m.feed(inner) {
+            Ok(ev) => ev,
+            Err(e) => {
+                host::error(&format!("exlap-hook: cred={} {}", s.cred(idx), e));
+                s.sessions[idx].state = SessionState::Failed;
+                push_connection_state(s, idx);
+                s.flush_machine(idx);
+                try_start_next_session(s);
+                return true;
             }
-        }
-        Phase::WaitCapabilities => {
-            // Advance if we got Capabilities, or if we got any Rsp (some HUs
-            // respond to Protocol with a plain <Rsp status="ok"/> and no body).
-            if xml.contains("<Capabilities") || xml.contains("<Rsp") {
-                with_state(|s| {
-                    if xml.contains("<Capabilities") {
-                        debug_log(&format!(
-                            "exlap-hook: got <Capabilities>; sending auth challenge \
-                             cred={} user=\"{}\"",
-                            s.cred_idx,
-                            s.user()
-                        ));
-                    } else {
-                        debug_log(&format!(
-                            "exlap-hook: Protocol Rsp (no Capabilities); sending auth challenge \
-                             cred={} user=\"{}\"",
-                            s.cred_idx,
-                            s.user()
-                        ));
+        },
+        None => return false,
+    };
+    // Whatever the Machine queued in response (Protocol, auth, Alive, ...).
+    s.flush_machine(idx);
+
+    for ev in events {
+        match ev {
+            Event::Authenticated => {
+                debug_log(&format!("exlap-hook: authenticated cred={}", s.cred(idx)));
+                push_connection_state(s, idx);
+                // Ask the server what this credential exposes.
+                if let Some(m) = s.sessions[idx].machine() {
+                    if let Err(e) = m.read_directory() {
+                        host::error(&format!("exlap-hook: read_directory cred={}: {e}", s.cred(idx)));
                     }
-                    let req = s.make_req(r#"<Authenticate phase="challenge" useHash="sha256"/>"#);
-                    s.phase = Phase::WaitAuthChallenge;
-                    s.send_xml(&req);
-                });
-            }
-        }
-        Phase::WaitAuthChallenge => {
-            if let Some(nonce_b64) = xml_attr_in_tag(xml, "Challenge", "nonce") {
-                debug_log(&format!(
-                    "exlap-hook: got auth challenge (nonce=\"{}\")",
-                    nonce_b64
-                ));
-                with_state(
-                    |s| match compute_auth_response(&nonce_b64, s.user(), s.password()) {
-                        Ok((cnonce_b64, digest_b64)) => {
-                            debug_log(&format!(
-                                "exlap-hook: sending auth response user=\"{}\"",
-                                s.user()
-                            ));
-                            let body = format!(
-                                r#"<Authenticate phase="response" user="{}" cnonce="{}" digest="{}"/>"#,
-                                s.user(),
-                                cnonce_b64,
-                                digest_b64
-                            );
-                            let req = s.make_req(&body);
-                            s.phase = Phase::WaitAuthResponse;
-                            s.send_xml(&req);
-                        }
-                        Err(e) => {
-                            host::error(&format!("exlap-hook: auth compute failed: {}", e));
-                        }
-                    },
-                );
-            } else if xml.contains("<Challenge") {
-                host::error("exlap-hook: <Challenge> element has no nonce attribute");
-            }
-        }
-        Phase::WaitAuthResponse => {
-            // Auth result is a bare <Rsp id=N/> (no status attribute) on success,
-            // matching ExlapReader.java (empty Rsp = authenticated); failure is
-            // <Rsp ... status="authenticationFailed"/>. Skip the Challenge <Rsp>,
-            // which belongs to WaitAuthChallenge.
-            if xml.contains("<Rsp") && !xml.contains("<Challenge") {
-                let status = xml_attr_in_tag(xml, "Rsp", "status").unwrap_or_default();
-                // Success = no error status AND an empty <Rsp> body. This is the
-                // union of our HU's behaviour (failure carries status=
-                // "authenticationFailed", success is a bare <Rsp/>) and
-                // ExlapReader.java's test (success = Rsp with zero child nodes).
-                let ok = (status.is_empty() || status == "ok") && !rsp_has_children(xml);
-                if ok {
-                    with_state(|s| {
-                        debug_log(&format!(
-                            "exlap-hook: authenticated with cred={} user=\"{}\"",
-                            s.cred_idx,
-                            s.user()
-                        ));
-                        // Enable the server heartbeat (ExLAP v1.3: ival is 0–60 s; 0
-                        // DISABLES it). We deliberately do NOT disable it: with the
-                        // heartbeat on, the HU detects when our client goes away (e.g. the
-                        // AA/USB link drops) and reaps the session. With ival=0 it never
-                        // does, so every reconnect leaks a session_id and the HU eventually
-                        // runs out of ExLAP slots and stops accepting new connections —
-                        // i.e. ExLAP dies after a handful of reconnections. The hook already
-                        // answers Alive pings (see handle_status_element / advance_statement),
-                        // so a live session keeps responding and only a genuinely dead one is
-                        // reaped. If the HU doesn't support <Heartbeat/> it returns
-                        // notImplemented (handled gracefully in Active phase).
-                        let hb_req =
-                            s.make_req(&format!("<Heartbeat ival=\"{}\"/>", HEARTBEAT_IVAL_SECS));
-                        s.send_xml(&hb_req);
-
-                        let body =
-                            r#"<Dir urlPattern="*" fromEntry="1" numOfEntries="999999999"/>"#;
-                        let req = s.make_req(body);
-                        s.phase = Phase::WaitUrlList;
-                        push_connection_state(s);
-                        s.send_xml(&req);
-                    });
-                } else {
-                    with_state(|s| {
-                        debug_log(&format!(
-                            "exlap-hook: auth failed cred={} user=\"{}\" status={:?}",
-                            s.cred_idx,
-                            s.user(),
-                            status
-                        ));
-                        let next = s.cred_idx + 1;
-                        if next < CREDENTIALS.len() {
-                            debug_log(&format!(
-                                "exlap-hook: trying cred={} user=\"{}\"",
-                                next, CREDENTIALS[next].0
-                            ));
-                            s.cred_idx = next;
-                            let req =
-                                s.make_req(r#"<Authenticate phase="challenge" useHash="sha256"/>"#);
-                            s.phase = Phase::WaitAuthChallenge;
-                            s.send_xml(&req);
-                        } else {
-                            host::error("exlap-hook: all credentials exhausted; ExLAP auth failed");
-                            s.phase = Phase::Failed;
-                            push_connection_state(s);
-                        }
-                    });
                 }
+                s.flush_machine(idx);
             }
-        }
-        Phase::WaitUrlList => {
-            if xml.contains("<UrlList") {
-                with_state(|s| {
-                    let urls = parse_url_list(xml);
-                    debug_log(&format!("exlap-hook: HU exposes {} URLs:", urls.len()));
-                    for entry in &urls {
-                        let url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("?");
-                        let typ = entry
-                            .get("url_type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?");
-                        debug_log(&format!("exlap-hook:   {} ({})", url, typ));
-                    }
-
-                    s.known_urls = urls.clone();
-
-                    let snapshot = serde_json::json!({
-                        "connection_state": "active",
-                        "subscription_limit_reached": false,
-                        "urls": urls,
-                        "values": {},
-                    });
-                    host::send_ws_event("exlap", &snapshot.to_string());
-
-                    s.phase = Phase::Active;
-                    s.subscription_limit_reached = false;
-
-                    // Resolve the list of URLs to subscribe to. A single "*" entry
-                    // subscribes to every URL the HU exposes; otherwise we keep the
-                    // configured URLs the HU actually offers (logging the ones it
-                    // doesn't, so a typo / unsupported URL is visible).
-                    let sub_urls = s.subscribe_urls.clone();
-                    let subscribe_all = sub_urls.iter().any(|u| u == "*");
-
-                    let available_urls: Vec<&str> = urls
-                        .iter()
-                        .filter_map(|e| e.get("url").and_then(|v| v.as_str()))
-                        .collect();
-
-                    let to_subscribe: Vec<String> = if subscribe_all {
-                        available_urls.iter().map(|u| u.to_string()).collect()
-                    } else {
-                        let mut wanted = Vec::new();
-                        for url in &sub_urls {
-                            if available_urls.contains(&url.as_str()) {
-                                wanted.push(url.clone());
-                            } else {
-                                debug_log(&format!(
-                                    "exlap-hook: configured URL \"{}\" not in HU list, skipping",
-                                    url
-                                ));
-                            }
-                        }
-                        wanted
-                    };
-
-                    // Subscribe to each resolved URL.
-                    for url in &to_subscribe {
-                        host::info(&format!("exlap-hook: subscribing to {}", url));
-                        let body = format!(r#"<Subscribe url="{}" timeStamp="true"/>"#, url);
-                        let req = s.make_req(&body);
-                        s.send_xml(&req);
-                    }
-                });
+            Event::Directory => {
+                on_directory(s, idx);
             }
-        }
-        Phase::Active => {
-            if xml.contains("<Rsp") {
-                if let Some(status) = xml_attr_in_tag(xml, "Rsp", "status") {
+            Event::Data(dat) => {
+                on_data(s, dat);
+            }
+            Event::Reply { id, xml } => {
+                if let Some(status) = exlap::reply_status(&xml) {
                     match status.as_str() {
                         "subscriptionLimitReached" => {
-                            debug_log("exlap-hook: HU subscription limit reached");
-                            with_state(|s| {
-                                s.subscription_limit_reached = true;
-                                push_connection_state(s);
-                            });
+                            debug_log(&format!("exlap-hook: cred={} subscription limit reached", s.cred(idx)));
+                            s.sessions[idx].subscription_limit_reached = true;
+                            push_connection_state(s, idx);
                         }
-                        "noMatchingUrl" => {
-                            debug_log("exlap-hook: HU returned noMatchingUrl");
-                        }
-                        other => {
-                            debug_log(&format!("exlap-hook: Rsp status={:?}", other));
-                        }
+                        "processing" => {}
+                        other => debug_log(&format!(
+                            "exlap-hook: cred={} reply id={id} status={other:?}",
+                            s.cred(idx)
+                        )),
                     }
                 }
             }
-            process_dat_messages(xml);
+            Event::Other(m) => {
+                debug_log(&format!("exlap-hook: cred={} rx {}", s.cred(idx), truncate_xml(&m, 160)));
+            }
+        }
+    }
+    true
+}
+
+/// Once a session's directory arrives: subscribe it to the URLs it owns (those
+/// not already claimed by an earlier-up credential), then start the next
+/// session.
+fn on_directory(s: &mut ExlapState, idx: usize) {
+    let cred = s.cred(idx);
+    // What this credential offers, split from callables, minus what earlier
+    // credentials already took (the divide policy, applied incrementally).
+    let (offered, callable_n): (Vec<String>, usize) = match s.sessions[idx].machine() {
+        Some(m) => {
+            let dir = m.directory();
+            let offered = dir
+                .iter()
+                .filter(|e| !e.callable)
+                .map(|e| e.url.clone())
+                .collect::<Vec<_>>();
+            (offered, dir.iter().filter(|e| e.callable).count())
+        }
+        None => return,
+    };
+
+    // Resolve the configured set: "*" means everything this session offers,
+    // otherwise the configured URLs the session actually has.
+    let want_all = s.subscribe_urls.iter().any(|u| u == "*");
+    let mut wanted: Vec<String> = if want_all {
+        offered.iter().filter(|u| !s.claimed.contains(*u)).cloned().collect()
+    } else {
+        s.subscribe_urls
+            .iter()
+            .filter(|u| offered.contains(u) && !s.claimed.contains(*u))
+            .cloned()
+            .collect()
+    };
+    wanted.sort();
+    wanted.dedup();
+
+    debug_log(&format!(
+        "exlap-hook: cred={cred} exposes {} data URLs ({callable_n} callables); \
+         subscribing to {} not already claimed",
+        offered.len(),
+        wanted.len()
+    ));
+
+    let ival = s.subscribe_ival_ms;
+    if !wanted.is_empty() {
+        if let Some(m) = s.sessions[idx].machine() {
+            // rates empty -> every URL at the default interval; `only` narrows the
+            // directory to exactly `wanted`.
+            if let Err(e) = m.subscribe(&[] as &[Rate], Some(ival), Some(&wanted)) {
+                host::error(&format!("exlap-hook: subscribe cred={cred}: {e}"));
+            }
+        }
+        s.flush_machine(idx);
+        for u in &wanted {
+            s.claimed.insert(u.clone());
+        }
+        s.sessions[idx].subscribed = true;
+    }
+
+    // Push the URL directory to the web UI for this session.
+    let urls = url_list_json(&s.sessions[idx]);
+    let snapshot = serde_json::json!({
+        "cred_idx": cred,
+        "user": exlap::USERS[cred],
+        "connection_state": "active",
+        "subscription_limit_reached": false,
+        "urls": urls,
+        "values": {},
+    });
+    host::send_ws_event("exlap", &snapshot.to_string());
+
+    // This credential's session is fully up, start the next one.
+    try_start_next_session(s);
+}
+
+/// A parsed `<Dat>`: record it, forward EV-relevant values to the energy model,
+/// and push the change to the web UI.
+fn on_data(s: &mut ExlapState, dat: Dat) {
+    let mut ev_updated = false;
+    match dat.url.as_str() {
+        "tankLevelPrimary" => {
+            if let Some(level) = dat.f64("level") {
+                let pct = (level * 100.0) as f32;
+                debug_log(&format!("exlap-hook: tankLevelPrimary/level={pct}%"));
+                s.tank_level = Some(pct);
+                ev_updated = true;
+            }
+        }
+        "outsideTemperature" => {
+            if let Some(t) = dat.f64("temperature") {
+                debug_log(&format!("exlap-hook: outsideTemperature={t} degC"));
+                s.outside_temp = Some(t as f32);
+            }
         }
         _ => {}
     }
+
+    // Build the web-UI change record from the parsed values. nodata/error
+    // fields are in `dat.missing` and deliberately not published as readings.
+    let fields: Vec<serde_json::Value> = dat
+        .values
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "name": v.name,
+                "type": v.kind.tag(),
+                "val": v.raw,
+                "unit": dat.unit_for(&v.name),
+            })
+        })
+        .collect();
+    // The <Dat timeStamp> the server stamped (subscriptions ask for it). Read
+    // from the raw message, since the parser lifts out only values; passed
+    // through verbatim rather than interpreted.
+    let timestamp = exlap::attr(&dat.raw, "timeStamp");
+    let change = serde_json::json!({
+        "url": dat.url,
+        "fields": fields,
+        "missing": dat.missing,
+        "state": dat.state,
+        "timestamp": timestamp,
+    });
+    s.current_values.insert(dat.url.clone(), change.clone());
+
+    if ev_updated {
+        let body = serde_json::json!({
+            "battery_level_percentage": s.tank_level,
+            "external_temp_celsius": s.outside_temp,
+            "battery_capacity_wh": s.battery_capacity_wh,
+        });
+        // rest_call_async so the POST doesn't block modify_packet: ureq has no
+        // default timeout and a slow local server would exceed the epoch
+        // deadline (100 epochs x 10 ms = 1 s) and corrupt the epoch state.
+        host::rest_call_async("POST", "/battery", &body.to_string());
+    }
+
+    host::send_ws_event("exlap", &serde_json::to_string(&[change]).unwrap_or_default());
 }
 
-/// Push a connection state event to the web UI.
-fn push_connection_state(s: &ExlapState) {
+/// Passively read `<Dat>` out of a session that is not ours (an orphan, or a
+/// phone-side client), so a measurement on the shared channel is not wasted.
+fn harvest_foreign(xml: &str) {
+    let inner = unwrap_statement(xml);
+    if let Some(dat) = exlap::parse_dat(inner) {
+        with_state(|s| on_data(s, dat));
+    }
+}
+
+/// Reset every session to Pending and clear the per-cycle claim set.
+fn reset_sessions(s: &mut ExlapState) {
+    s.sessions = s.creds.iter().map(|_| Session::pending()).collect();
+    s.claimed.clear();
+    s.connecting_started = false;
+    for idx in 0..s.sessions.len() {
+        push_connection_state(s, idx);
+    }
+}
+
+/// The directory as web-UI JSON, or an empty list before it is read.
+fn url_list_json(sess: &Session) -> Vec<serde_json::Value> {
+    match &sess.state {
+        SessionState::Running(m) => m
+            .directory()
+            .iter()
+            .map(|e: &Entry| {
+                serde_json::json!({
+                    "url": e.url,
+                    "url_type": if e.callable { "function" } else { "data" },
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Push a connection-state event to the web UI for one session.
+fn push_connection_state(s: &ExlapState, idx: usize) {
+    let cred = s.cred(idx);
     let event = serde_json::json!({
-        "connection_state": phase_str(&s.phase),
-        "subscription_limit_reached": s.subscription_limit_reached,
+        "cred_idx": cred,
+        "user": exlap::USERS[cred],
+        "connection_state": conn_state(&s.sessions[idx]),
+        "subscription_limit_reached": s.sessions[idx].subscription_limit_reached,
     });
     host::send_ws_event("exlap", &event.to_string());
 }
 
-fn phase_str(phase: &Phase) -> &'static str {
-    match phase {
-        Phase::Active => "active",
-        Phase::Failed => "failed",
+/// The web-UI connection-state string for a session.
+fn conn_state(sess: &Session) -> &'static str {
+    match &sess.state {
+        SessionState::Failed => "failed",
+        SessionState::Running(m) if m.phase() == Phase::Ready => "active",
         _ => "connecting",
     }
 }
 
-// ── Dat message processing ────────────────────────────────────────────────────
-
-fn process_dat_messages(xml: &str) {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut current_url: Option<String> = None;
-    // Collect all fields per Dat object (spec shows multi-field objects like WGS84Position).
-    let mut current_fields: Vec<serde_json::Value> = Vec::new();
-    let mut current_timestamp: Option<String> = None;
-    let mut dat_depth: u32 = 0;
-
-    let mut changes: Vec<serde_json::Value> = Vec::new();
-    let mut ev_updated = false;
-
-    // Parse name/val/state from a field element and push to current_fields,
-    // also updating the EV-relevant state values.
-    macro_rules! push_field {
-        ($e:expr, $tag:expr) => {{
-            let name = attr_value($e, b"name").unwrap_or_default();
-            let val = attr_value($e, b"val").unwrap_or_default();
-            let state = attr_value($e, b"state").unwrap_or_else(|| "ok".to_string());
-            if state != "nodata" && state != "error" {
-                if let (Some(url), Ok(v)) = (current_url.as_deref(), val.parse::<f32>()) {
-                    match url {
-                        "tankLevelPrimary" if name == "level" => {
-                            let pct = v * 100.0;
-                            debug_log(&format!("exlap-hook: tankLevelPrimary/level={}%", pct));
-                            with_state(|s| s.tank_level = Some(pct));
-                            ev_updated = true;
-                        }
-                        "outsideTemperature" => {
-                            debug_log(&format!("exlap-hook: outsideTemperature={}°C", v));
-                            with_state(|s| s.outside_temp = Some(v));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            current_fields.push(serde_json::json!({
-                "name": name,
-                "type": $tag,
-                "val": val,
-                "state": state,
-            }));
-        }};
-    }
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                let tag = std::str::from_utf8(e.name().local_name().as_ref())
-                    .unwrap_or("")
-                    .to_string();
-                match tag.as_str() {
-                    "Dat" if dat_depth == 0 => {
-                        current_url = attr_value(e, b"url");
-                        current_timestamp = attr_value(e, b"timeStamp");
-                        current_fields.clear();
-                        dat_depth = 1;
-                    }
-                    "Rel" | "Abs" | "Act" | "Enm" | "Txt" | "Tim" | "Bin" if dat_depth == 1 => {
-                        push_field!(e, tag);
-                        dat_depth += 1; // balanced by the matching Event::End
-                    }
-                    _ if dat_depth > 0 => {
-                        dat_depth += 1;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Empty(ref e)) => {
-                // Self-closing elements produce no Event::End, so dat_depth must
-                // not change when we parse field elements — otherwise subsequent
-                // fields in the same <Dat> fall out of the dat_depth == 1 guard
-                // and are silently dropped.
-                let tag = std::str::from_utf8(e.name().local_name().as_ref())
-                    .unwrap_or("")
-                    .to_string();
-                match tag.as_str() {
-                    "Dat" if dat_depth == 0 => {
-                        // Self-closing <Dat/> — commit immediately with no fields.
-                        current_url = attr_value(e, b"url");
-                        current_timestamp = attr_value(e, b"timeStamp");
-                        current_fields.clear();
-                        if let Some(url) = current_url.take() {
-                            changes.push(serde_json::json!({
-                                "url": url,
-                                "fields": [],
-                                "timestamp": current_timestamp,
-                            }));
-                        }
-                    }
-                    "Rel" | "Abs" | "Act" | "Enm" | "Txt" | "Tim" | "Bin" if dat_depth == 1 => {
-                        push_field!(e, tag);
-                        // dat_depth stays at 1: no End event is coming.
-                    }
-                    _ => {} // ignore at other depths
-                }
-            }
-            Ok(Event::End(ref e)) => {
-                let local = e.name().local_name();
-                let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
-                if tag == "Dat" {
-                    if let Some(url) = current_url.take() {
-                        changes.push(serde_json::json!({
-                            "url": url,
-                            "fields": current_fields.clone(),
-                            "timestamp": current_timestamp,
-                        }));
-                        current_fields.clear();
-                    }
-                    dat_depth = 0;
-                } else if dat_depth > 0 {
-                    dat_depth -= 1;
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-
-    if ev_updated {
-        let (tank, temp, cap) =
-            with_state(|s| (s.tank_level, s.outside_temp, s.battery_capacity_wh));
-        let body = serde_json::json!({
-            "battery_level_percentage": tank,
-            "external_temp_celsius": temp,
-            "battery_capacity_wh": cap,
-        });
-        // Use rest_call_async so the HTTP POST to /battery doesn't block modify_packet.
-        // ureq has no default timeout; a slow local server would otherwise exceed the
-        // packet_epoch_deadline (100 epochs × 10 ms = 1 s) and corrupt the epoch state.
-        // The result is delivered as a WS event which we don't need to act on.
-        host::rest_call_async("POST", "/battery", &body.to_string());
-    }
-
-    if !changes.is_empty() {
-        with_state(|s| {
-            for change in &changes {
-                if let Some(url) = change.get("url").and_then(|v| v.as_str()) {
-                    s.current_values.insert(url.to_string(), change.clone());
-                }
-            }
-        });
-        let payload = serde_json::to_string(&changes).unwrap_or_default();
-        host::send_ws_event("exlap", &payload);
-    }
-}
-
-// ── Auth ──────────────────────────────────────────────────────────────────────
-
-/// Compute the ExLAP SHA-256 auth digest.
-///
-/// Matches SHA256Digest.calculate() from the VW MediaControl APK:
-///   sha256("{user}:{password}:{b64(nonce_bytes)}:{b64(cnonce_bytes)}") → base64
-/// No field truncation — the Java implementation concatenates the full strings.
-fn compute_auth_response(
-    nonce_b64: &str,
-    user: &str,
-    password: &str,
-) -> Result<(String, String), String> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    let nonce_bytes = b64.decode(nonce_b64).map_err(|e| e.to_string())?;
-    let nonce_clean = b64.encode(&nonce_bytes);
-
-    let mut cnonce_raw = [0u8; 16];
-    getrandom::getrandom(&mut cnonce_raw).map_err(|e| e.to_string())?;
-    let cnonce_b64 = b64.encode(&cnonce_raw);
-
-    // Match ExlapReader.java computeDigest exactly: each field is truncated to
-    // 44 chars (`%.44s`) before hashing. This also normalises the credential
-    // padding — a 45-char "…==" secret and a 44-char "…=" secret truncate to the
-    // same 44 chars — which is why the reference does it. (Dev commit 56160c5
-    // dropped this based on the VW MediaControl APK; the VAG HU rejects the
-    // resulting digest, so we restore the reference behaviour.)
-    let input = format!(
-        "{:.44}:{:.44}:{:.44}:{:.44}",
-        user, password, nonce_clean, cnonce_b64
-    );
-    let hash = sha2::Sha256::digest(input.as_bytes());
-    let digest_b64 = b64.encode(hash.as_slice());
-
-    Ok((cnonce_b64, digest_b64))
-}
-
-// ── Channel open helpers ──────────────────────────────────────────────────────
+// -- ServiceDiscoveryResponse protobuf parsing (AA transport, unchanged) --------
 
 /// Build a CHANNEL_OPEN_REQUEST packet for the given channel and service_id.
-/// Currently unused — the phone opens the ExLAP channel itself (see handle_sdr).
+/// Currently unused, the phone opens the ExLAP channel itself (see handle_sdr).
 /// Kept for a possible future fallback (would need to be enqueued, not sent
 /// directly, so it flushes toward the HU from a dir=MD invocation).
 #[allow(dead_code)]
 fn build_chan_open_request(channel: u8, service_id: i32) -> Packet {
-    // Protobuf ChannelOpenRequest { priority: sint32 = 0, service_id: int32 = X }
-    // Field 1 (priority, sint32 zigzag): tag=0x08, zigzag(0)=0x00
-    // Field 2 (service_id, int32):       tag=0x10, varint(service_id)
     let mut payload = vec![
         (MSG_CHANNEL_OPEN_REQUEST >> 8) as u8,
         (MSG_CHANNEL_OPEN_REQUEST & 0xFF) as u8,
@@ -1381,7 +1346,6 @@ fn find_exlap_service_id(data: &[u8]) -> Option<i32> {
         let wire = (tag & 0x7) as u8;
         match (field, wire) {
             (1, 2) => {
-                // services: repeated Service
                 let (len, n) = read_varint(data, pos)?;
                 pos += n;
                 let end = pos + len as usize;
@@ -1541,97 +1505,88 @@ fn encode_varint(mut v: u64, buf: &mut Vec<u8>) {
     }
 }
 
-// ── XML helpers ───────────────────────────────────────────────────────────────
+// -- Tiny XML readers for the AA wrapper elements only --------------------------
+//
+// The ExLAP payload itself is parsed by the crate. These read the Android Auto
+// wrapper elements the crate never sees: <ExlapStatement>, <ExlapConnectionReturn>.
 
 fn xml_root_tag(xml: &str) -> Option<String> {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                return Some(
-                    std::str::from_utf8(e.name().local_name().as_ref())
-                        .unwrap_or("")
-                        .to_owned(),
-                );
-            }
-            Ok(Event::Eof) | Err(_) => return None,
-            _ => {}
-        }
+    let open = xml.find('<')?;
+    let rest = &xml[open + 1..];
+    let end = rest.find(|c: char| c == ' ' || c == '>' || c == '/').unwrap_or(rest.len());
+    let tag = &rest[..end];
+    if tag.is_empty() || tag.starts_with('?') || tag.starts_with('!') {
+        return None;
     }
+    Some(tag.to_string())
 }
 
-/// True if the `<Rsp>` element has a non-empty body (at least one nested tag).
-/// Mirrors ExlapReader.java's `root.getChildNodes().getLength() == 0` auth test:
-/// an empty Rsp (self-closing `<Rsp/>` or `<Rsp></Rsp>`) means success.
-fn rsp_has_children(xml: &str) -> bool {
-    let Some(start) = xml.find("<Rsp") else {
-        return false;
-    };
-    let Some(gt) = xml[start..].find('>') else {
-        return false;
-    };
-    let open_end = start + gt;
-    // Self-closing `<Rsp .../>` → no children.
-    if xml.as_bytes().get(open_end.saturating_sub(1)) == Some(&b'/') {
-        return false;
-    }
-    let body_start = open_end + 1;
-    let Some(close_rel) = xml[body_start..].find("</Rsp>") else {
-        return false;
-    };
-    xml[body_start..body_start + close_rel].contains('<')
-}
-
+/// Read `attr="value"` off the first `<tag ...>` element in `xml`.
 fn xml_attr_in_tag(xml: &str, tag_name: &str, attr_name: &str) -> Option<String> {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-    let attr_bytes = attr_name.as_bytes();
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if std::str::from_utf8(e.name().local_name().as_ref()).unwrap_or("") == tag_name {
-                    return attr_value(&e, attr_bytes);
-                }
-            }
-            Ok(Event::Eof) | Err(_) => return None,
-            _ => {}
-        }
-    }
+    let open = xml.find(&format!("<{tag_name}"))?;
+    let rest = &xml[open..];
+    let end = rest.find('>').map(|i| i + 1).unwrap_or(rest.len());
+    let elem = &rest[..end];
+    let needle = format!("{attr_name}=\"");
+    let at = elem.find(&needle)? + needle.len();
+    let tail = &elem[at..];
+    tail.find('"').map(|e| tail[..e].to_string())
 }
 
-/// Parse `<Match url="..." type="..."/>` elements from a `<UrlList>` response.
-fn parse_url_list(xml: &str) -> Vec<serde_json::Value> {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    let mut urls = Vec::new();
-    loop {
-        match reader.read_event() {
-            Ok(Event::Empty(e)) => {
-                if std::str::from_utf8(e.name().local_name().as_ref()).unwrap_or("") == "Match" {
-                    if let Some(u) = attr_value(&e, b"url") {
-                        let url_type = attr_value(&e, b"type").unwrap_or_default();
-                        urls.push(serde_json::json!({ "url": u, "url_type": url_type }));
-                    }
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-    urls
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn attr_value(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> {
-    e.attributes()
-        .filter_map(|a| a.ok())
-        .find(|a| a.key.local_name().as_ref() == name)
-        .and_then(|a| a.unescape_value().ok())
-        .map(|v| v.into_owned())
+    #[test]
+    fn unwrap_returns_the_inner_message() {
+        let x = r#"<ExlapStatement session_id="abc"><Rsp id="5"/></ExlapStatement>"#;
+        assert_eq!(unwrap_statement(x), r#"<Rsp id="5"/>"#);
+        // A bare status has no wrapper and comes back whole.
+        assert_eq!(unwrap_statement("<Status><Init/></Status>"), "<Status><Init/></Status>");
+        // A wrapper with attributes on the inner element survives.
+        let d = r#"<ExlapStatement session_id="x"><Dat url="vehicleSpeed"><Abs name="speed" val="3"/></Dat></ExlapStatement>"#;
+        assert_eq!(unwrap_statement(d), r#"<Dat url="vehicleSpeed"><Abs name="speed" val="3"/></Dat>"#);
+    }
+
+    #[test]
+    fn wrap_frames_a_request() {
+        assert_eq!(
+            wrap("sid1", r#"<Req id="9"><Alive/></Req>"#),
+            r#"<ExlapStatement session_id="sid1"><Req id="9"><Alive/></Req></ExlapStatement>"#
+        );
+    }
+
+    #[test]
+    fn root_tag_reads_the_first_element() {
+        assert_eq!(xml_root_tag("<ExlapBeacon/>").as_deref(), Some("ExlapBeacon"));
+        assert_eq!(xml_root_tag(r#"<ExlapStatement session_id="a">"#).as_deref(), Some("ExlapStatement"));
+        assert_eq!(xml_root_tag("  <Status><Init/></Status>").as_deref(), Some("Status"));
+        assert_eq!(xml_root_tag("garbage"), None);
+    }
+
+    #[test]
+    fn attr_reads_the_named_wrapper_attribute() {
+        let x = r#"<ExlapConnectionReturn session_id="s" connected="true"/>"#;
+        assert_eq!(xml_attr_in_tag(x, "ExlapConnectionReturn", "connected").as_deref(), Some("true"));
+        assert_eq!(xml_attr_in_tag(x, "ExlapConnectionReturn", "session_id").as_deref(), Some("s"));
+        assert_eq!(xml_attr_in_tag(x, "ExlapConnectionReturn", "missing"), None);
+    }
+
+    #[test]
+    fn creds_parse_with_a_sane_fallback() {
+        assert_eq!(parse_creds("2,1,3,0"), vec![2, 1, 3, 0]);
+        assert_eq!(parse_creds(" 1 , 2 "), vec![1, 2]);
+        assert_eq!(parse_creds("9,8"), DEFAULT_CREDS.to_vec(), "out-of-range -> default");
+        assert_eq!(parse_creds(""), DEFAULT_CREDS.to_vec());
+    }
+
+    #[test]
+    fn call_params_parse_into_typed_values() {
+        let v = serde_json::json!([{"kind":"Enm","name":"Source","val":"HDD"}]);
+        let params = parse_params(Some(&v));
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].kind, Kind::Enm);
+        assert_eq!(exlap::call("Media_SwitchSource", &params),
+                   r#"<Call url="Media_SwitchSource"><Enm name="Source" val="HDD"/></Call>"#);
+    }
 }

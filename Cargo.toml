@@ -7,16 +7,14 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-# SHA-256 — pure Rust, works in WASM
-sha2 = "0.10"
-# Base64 encoding/decoding — replaces openssl::base64
-base64 = "0.22"
-# CSPRNG via WASI random_get — replaces openssl::rand::rand_bytes
+# The shared ExLAP protocol core. This hook drives its `Machine` over the
+# Android Auto vendor channel. The same `Machine` also runs over a TCP socket.
+# The protocol logic is fixed once, for both transports.
+exlap = "0.1"
+# CSPRNG via WASI random_get, for the session id and the auth client nonce.
 getrandom = { version = "0.2" }
 wit-bindgen-rt = "0.41"
-# XML parsing — same approach as native exlap.rs
-quick-xml = "0.36"
-# JSON serialisation for event payloads and REST bodies
+# JSON for the event payloads and the REST bodies.
 serde_json = "1"
 
 [package.metadata.component]
